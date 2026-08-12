@@ -1,5 +1,14 @@
 from enum import Enum
 
+"""
+SessionStatus 状态流转：
+
+pending → running → completed
+                 ↘ failed
+                 ↘ awaiting_input → running（用户补充后继续）
+                 
+awaiting_input 是一个特殊暂停状态，表示流水线跑到某步发现信息不足，需要用户再提供输入才能继续。
+"""
 
 class SessionStatus(str, Enum):
     PENDING = "pending"           # 已创建，等待处理
@@ -8,8 +17,13 @@ class SessionStatus(str, Enum):
     FAILED = "failed"             # 执行失败，流程终止
     AWAITING_INPUT = "awaiting_input"  # 等待用户补充输入
 
+"""
+PageStatus 状态流转：
 
+draft → published → archived
+
+"""
 class PageStatus(str, Enum):
     DRAFT = "draft"               # 草稿，生成中或未发布
     PUBLISHED = "published"       # 已发布，对外可访问
-    ARCHIVED = "archived"         # 已归档，旧版本
+    ARCHIVED = "archived"         # 已归档，旧版本,被新版本替代后归档，不删除保留历史
