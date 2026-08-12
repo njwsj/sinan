@@ -930,6 +930,24 @@ open http://localhost:8000/api/v1/page/page_XXXXXXXX
 - [ ] `page_version` 表：1 条记录，`html_content` 有完整 HTML 内容
 - [ ] **端到端跑通，能在浏览器看到一个 HTML 页面**
 
+### 1.3 总结
+
+#### 1.3.1 phase1 流程
+
+- 首先调用`/api/v1/generate`接口
+  - 调用SessionStore.create方法（生成session，并存入**GenSession**表中）
+  - 使用返回的session.id 调用generation_runner.start(session.id)
+    - 更新GenSession表中该session.id的状态为RUNNING
+    - 全局定义html变量
+    - 遍历定义的steps（receive、analyze等）
+      - 每个step都event_bus.publish(session_id, step_name, {"message": message})，放到内部维护的`dict[session_id → asyncio.Queue]`（session_id → asyncio.Queue[GenerationEvent | _SENTINEL]）以供`/api/v1/generate/{{session_id}}/stream`接口动态获取
+      - 每个step都调用_write_step(session_id, step_name, message)将步骤执行记录写入 **gen_session_step** 表
+      - 当step为code阶段时，生成html
+    - 遍历完成，将生成的全局变量html代码保存到**PageVersion**表中
+    - 将该session_id的GenSession表记录的状态更新为COMPLETED
+    - event_bus.publish「页面已生成」信息
+    - event_bus.publish_done(session_id) 向队列加入一个哨兵节点，关闭 SSE 流
+
 ---
 
 ## 五、Phase 2：接入 LLM — 让 AI 生成页面
