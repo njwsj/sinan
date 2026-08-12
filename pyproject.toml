@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sinan"
+version = "0.1.0"
+description = "AI Page Generation Service"
+requires-python = ">=3.12"
+
+[project.scripts]
+sinan = "sinan.cmdline:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sinan"]
