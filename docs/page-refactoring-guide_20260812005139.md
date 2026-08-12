@@ -410,74 +410,525 @@ volumes:
 
 **目标**：用户发送一段文字描述，系统返回一个硬编码的 HTML 页面。**不接 LLM**，只跑通骨架。
 
-**预计工时**：2-3 天
-
 ### 1.1 本阶段做什么
 
-1. **API 层**：`POST /api/v1/generate` 接收用户 prompt，返回 session_id
-2. **SSE 推送**：`GET /api/v1/generate/{session_id}/stream` 推送步骤进度
-3. **生成运行器**：硬编码一个"生成器"，根据 prompt 返回固定 HTML 模板
-4. **Session 存储**：MySQL 持久化 + Redis 缓存
-5. **预览**：`GET /api/v1/page/{marker}` 返回 HTML 内容
+端到端路径：
 
-### 1.2 核心代码骨架
+```
+POST /api/v1/generate
+    → 创建 session（MySQL）
+    → 后台异步跑生成流程（5 个步骤）
+    → SSE 推送步骤进度
+    → 存储硬编码 HTML（MySQL）
+    → GET /api/v1/page/{marker} 返回 HTML
+```
+
+涉及文件变动：
+
+```
+sinan/
+├── api/
+│   ├── app.py                   ← 修改：注册 generate_router、preview_router
+│   ├── deps.py                  ← 修改：加注释说明设计意图
+│   └── routes/
+│       ├── generate.py          ← Step 1：新建（路由层）
+│       └── preview.py           ← Step 5：新建（预览端点）
+└── services/
+    ├── session_store.py         ← Step 2：新建（MySQL 持久化）
+    ├── generation_event_bus.py  ← Step 3：新建（SSE 事件通道）
+    └── generation_runner.py     ← Step 4：新建（硬编码生成流程）
+```
+
+---
+
+### Step 1：新建 `sinan/api/routes/generate.py`
+
+**做什么**：实现两个路由端点。
+
+- `POST /api/v1/generate`：接收用户的 `prompt` 和 `user_id`，调用 `session_store` 创建数据库记录，然后用 `asyncio.create_task` 把生成任务扔到后台异步执行（注意不能 `await`，否则接口会挂住等生成完才返回），立即返回 `session_id`。
+- `GET /api/v1/generate/{session_id}/stream`：SSE 长连接，订阅 `event_bus` 里这个 session 的事件队列，把每一条事件推送给客户端。客户端可以在任意时刻连接，`asyncio.Queue` 会缓存 runner 已经发出但还没被消费的事件。
+
+**注意点**：
+
+- `sse_starlette` 需要在 `requirements.txt` 里已经存在（Phase 0 已装）。
+- 路由前缀 `/api/v1` 在 `app.py` 的 `include_router` 里统一加，这里路由本身不带。
+- `Body(..., embed=True)` 表示请求体是 `{"prompt": "...", "user_id": "..."}` 形式的 JSON，两个字段并列。
 
 ```python
-# page_gen/api/routes/generate.py
-from fastapi import APIRouter, Depends
+# sinan/api/routes/generate.py
+import asyncio
+import json
+from fastapi import APIRouter, Body
 from sse_starlette.sse import EventSourceResponse
+from sinan.services.session_store import session_store
+from sinan.services.generation_event_bus import event_bus
+from sinan.services.generation_runner import generation_runner
 
-router = APIRouter(prefix="/api/v1/generate")
+router = APIRouter()
 
-@router.post("")
-async def create_generation(prompt: str = Body(...)):
-    """创建生成任务"""
-    session = await session_store.create(prompt=prompt)
-    # 异步启动生成流程
-    await generation_runner.start(session.id)
+
+@router.post("/generate")
+async def create_generation(
+    prompt: str = Body(..., embed=True),
+    user_id: str = Body("anonymous", embed=True),
+):
+    """
+    创建生成任务。
+    立即返回 session_id，后台异步执行生成流程。
+    """
+    session = await session_store.create(user_id=user_id, prompt=prompt)
+    # create_task 把 runner 扔到事件循环后台，不阻塞当前请求
+    asyncio.create_task(generation_runner.start(session.id))
     return {"session_id": session.id, "status": "running"}
 
-@router.get("/{session_id}/stream")
+
+@router.get("/generate/{session_id}/stream")
 async def stream_generation(session_id: str):
-    """SSE 推送生成进度"""
+    """
+    SSE 长连接，推送该 session 的生成步骤事件。
+    事件格式：event: <step_name>  data: {"message": "..."}
+    """
     async def event_generator():
-        async for event in generation_event_bus.subscribe(session_id):
-            yield {"event": event.type, "data": event.json()}
+        async for evt in event_bus.subscribe(session_id):
+            yield {"event": evt.type, "data": json.dumps(evt.data, ensure_ascii=False)}
+
     return EventSourceResponse(event_generator())
 ```
 
+---
+
+### Step 2：新建 `sinan/services/session_store.py`
+
+**做什么**：封装对 `GenSession` 表的增删改查，提供三个方法：
+
+- `create(user_id, prompt)`：生成 UUID 作为主键，插入数据库，返回 ORM 对象。
+- `get(session_id)`：按主键查询，不存在时返回 `None`。
+- `update(session_id, **kwargs)`：通用更新，通过关键字参数批量 setattr，适配后续各种状态字段更新。
+
+**注意点**：
+
+- runner 是后台任务，不在 FastAPI 请求生命周期内，所以不能用 `Depends` 注入 db session，必须每次操作自己 `async with AsyncSessionLocal() as db`，用完自动关闭。
+- `db.refresh(session)` 在 commit 之后调用，目的是重新从数据库加载对象，确保返回的对象字段（如 `created_at`）是数据库实际写入的值，避免返回 Python 层面的默认值。
+
 ```python
-# page_gen/services/generation_runner.py（Phase 1 硬编码版）
-class GenerationRunner:
-    async def start(self, session_id: str):
-        session = await session_store.get(session_id)
-        # 步骤 1: 接收
-        await self._emit(session_id, "receive", "正在接收需求...")
-        # 步骤 2: "分析"（硬编码）
-        await self._emit(session_id, "analyze", "正在分析需求...")
-        await asyncio.sleep(0.5)
-        # 步骤 3: "生成"（硬编码 HTML）
-        await self._emit(session_id, "code", "正在生成页面...")
-        html = self._template_html(session.prompt)
-        # 步骤 4: "验证"（硬编码通过）
-        await self._emit(session_id, "verify", "验证通过")
-        # 步骤 5: 托管
-        marker = f"page_{session_id[:8]}"
-        version = 1
-        await page_store.save(marker, version, html)
-        await self._emit(session_id, "host", f"已托管: /page/{marker}")
-        # 完成
-        await session_store.update(session_id, status="completed",
-                                    marker=marker, version=version)
+# sinan/services/session_store.py
+import uuid
+from sqlalchemy import select
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import GenSession
+from sinan.models.enums import SessionStatus
+
+
+class SessionStore:
+    async def create(self, user_id: str, prompt: str) -> GenSession:
+        """创建新 session，写入数据库，返回 ORM 对象"""
+        session_id = str(uuid.uuid4())
+        session = GenSession(
+            id=session_id,
+            user_id=user_id,
+            prompt=prompt,
+            status=SessionStatus.PENDING,
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(session)
+            await db.commit()
+            await db.refresh(session)
+        return session
+
+    async def get(self, session_id: str) -> GenSession | None:
+        """按 ID 查询 session，不存在返回 None"""
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(GenSession).where(GenSession.id == session_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def update(self, session_id: str, **kwargs) -> None:
+        """
+        通用字段更新。
+        用法示例：await session_store.update(sid, status=SessionStatus.COMPLETED, marker="page_abc")
+        """
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(GenSession).where(GenSession.id == session_id)
+            )
+            session = result.scalar_one_or_none()
+            if session is None:
+                return
+            for key, value in kwargs.items():
+                setattr(session, key, value)
+            await db.commit()
+
+
+# 模块级单例，路由和 runner 直接 import 使用
+session_store = SessionStore()
 ```
 
-### 1.3 验收标准
+---
 
-- [ ] `POST /api/v1/generate` with `{"prompt": "做一个数据看板"}` 返回 session_id
-- [ ] SSE 流推送 5 个步骤事件
-- [ ] `GET /api/v1/page/{marker}` 返回 HTML 页面
-- [ ] 数据库中有完整的 session 和 step 记录
-- [ ] **端到端跑通，能看到一个 HTML 页面**
+### Step 3：新建 `sinan/services/generation_event_bus.py`
+
+**做什么**：提供一个基于内存 `asyncio.Queue` 的发布/订阅事件通道，用于 runner 和 SSE 路由之间的通信。
+
+架构：内部维护一个 `dict[session_id → asyncio.Queue]`，runner 往 queue 里 `put` 事件，SSE 路由异步 `get` 消费。
+
+- `publish(session_id, event_type, data)`：往对应 queue 推一条事件。
+- `publish_done(session_id)`：推一个哨兵对象 `_SENTINEL`，通知 subscriber 生成已结束，关闭 SSE 连接。
+- `subscribe(session_id)`：异步生成器，不断从 queue 取事件 yield 出去，遇到 `_SENTINEL` 时停止并清理 queue。
+
+**注意点**：
+
+- `_SENTINEL = object()` 是一个唯一对象，用 `is` 判断，不会误判成正常事件。
+- 如果 SSE 客户端在 runner 开始之前就连上，`Queue` 会阻塞在 `await q.get()` 等待，没有竞态问题。
+- Phase 1 不处理客户端提前断连的边界情况（queue 会留在内存），Phase 2+ 可加超时清理。
+
+```python
+# sinan/services/generation_event_bus.py
+import asyncio
+from dataclasses import dataclass
+from typing import AsyncGenerator
+
+_SENTINEL = object()  # 用于通知 subscriber 生成流程已结束
+
+
+@dataclass
+class GenerationEvent:
+    type: str   # 对应步骤名，如 receive / analyze / design / code / verify / host
+    data: dict  # 事件内容，至少包含 {"message": "..."}
+
+
+class GenerationEventBus:
+    def __init__(self):
+        # session_id → asyncio.Queue[GenerationEvent | _SENTINEL]
+        self._queues: dict[str, asyncio.Queue] = {}
+
+    def _get_or_create_queue(self, session_id: str) -> asyncio.Queue:
+        if session_id not in self._queues:
+            self._queues[session_id] = asyncio.Queue()
+        return self._queues[session_id]
+
+    async def publish(self, session_id: str, event_type: str, data: dict) -> None:
+        """发布一条步骤事件"""
+        q = self._get_or_create_queue(session_id)
+        await q.put(GenerationEvent(type=event_type, data=data))
+
+    async def publish_done(self, session_id: str) -> None:
+        """通知 subscriber 生成已完成，关闭 SSE 流"""
+        q = self._get_or_create_queue(session_id)
+        await q.put(_SENTINEL)
+
+    async def subscribe(self, session_id: str) -> AsyncGenerator[GenerationEvent, None]:
+        """
+        异步生成器：持续 yield 该 session 的事件，直到收到终止信号。
+        SSE 路由用 async for 消费。
+        """
+        q = self._get_or_create_queue(session_id)
+        while True:
+            item = await q.get()
+            if item is _SENTINEL:
+                # 清理 queue，防止内存泄漏
+                self._queues.pop(session_id, None)
+                break
+            yield item
+
+
+# 模块级单例
+event_bus = GenerationEventBus()
+```
+
+---
+
+### Step 4：新建 `sinan/services/generation_runner.py`
+
+**做什么**：Phase 1 的核心，模拟完整的 5 步生成流程（全部硬编码，无 LLM）。
+
+流程：
+
+1. `receive` — 更新 session 状态为 RUNNING，推送"接收需求"事件
+2. `analyze` — 推送"分析需求"事件
+3. `design` — 推送"设计页面结构"事件
+4. `code` — 调用 `_template_html(prompt)` 生成硬编码 HTML，推送"生成页面"事件
+5. `verify` — 推送"验证通过"事件
+6. `host`（不计入步骤表）— 把 HTML 写入 `PageVersion` 表，更新 session 字段，推送托管完成事件，最后调用 `publish_done` 关闭 SSE
+
+每个步骤都会：
+
+- 调用 `event_bus.publish` 推送 SSE 事件
+- `asyncio.sleep(0.5)` 模拟耗时（Phase 2 替换为真实 LLM 调用）
+- 调用 `_write_step` 写一条 `GenSessionStep` 记录到数据库
+
+**注意点**：
+
+- `_template_html` 里有 f-string + CSS `{{}}` 的双括号写法，是为了转义 f-string 里的花括号，写出来的 HTML 里是单括号 `{}`，这是正常的。
+- runner 是后台协程，**不能用断点调试**（调试器会冻住事件循环，SSE 无法收到数据），用 `print` 观察状态即可。
+- `_save_page` 里 `created_by` 传 `session_id`，Phase 2 完善用户体系后再改。
+
+```python
+# sinan/services/generation_runner.py
+import asyncio
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import GenSessionStep, PageVersion
+from sinan.models.enums import SessionStatus, PageStatus
+from sinan.services.session_store import session_store
+from sinan.services.generation_event_bus import event_bus
+
+
+class GenerationRunner:
+
+    async def start(self, session_id: str) -> None:
+        """
+        后台异步执行生成流程。
+        由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
+        """
+        await session_store.update(session_id, status=SessionStatus.RUNNING)
+
+        # 步骤定义：(step_name, 推送给前端的消息)
+        steps = [
+            ("receive", "正在接收需求..."),
+            ("analyze", "正在分析需求..."),
+            ("design",  "正在设计页面结构..."),
+            ("code",    "正在生成页面..."),
+            ("verify",  "验证通过"),
+        ]
+
+        html = ""
+        for step_name, message in steps:
+            await event_bus.publish(session_id, step_name, {"message": message})
+            await asyncio.sleep(0.5)  # 模拟耗时，Phase 2 替换为 LLM 调用
+            await self._write_step(session_id, step_name, message)
+
+            if step_name == "code":
+                # code 步骤：生成硬编码 HTML
+                session = await session_store.get(session_id)
+                prompt = session.prompt if session else ""
+                html = self._template_html(prompt)
+
+        # 托管：写 page_version 表，更新 session
+        marker = f"page_{session_id[:8]}"
+        version = 1
+        await self._save_page(marker, version, html, created_by=session_id)
+        await session_store.update(
+            session_id,
+            status=SessionStatus.COMPLETED,
+            marker=marker,
+            version=version,
+            preview_url=f"/api/v1/page/{marker}",
+        )
+
+        # 推送托管完成事件，再关闭 SSE 流
+        await event_bus.publish(
+            session_id,
+            "host",
+            {"message": f"页面已生成，预览地址: /api/v1/page/{marker}", "url": f"/api/v1/page/{marker}"},
+        )
+        await event_bus.publish_done(session_id)
+
+    async def _write_step(self, session_id: str, step: str, message: str) -> None:
+        """把步骤执行记录写入 gen_session_step 表"""
+        record = GenSessionStep(
+            session_id=session_id,
+            step=step,
+            direction="output",
+            output_data={"message": message},
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+    async def _save_page(self, marker: str, version: int, html: str, created_by: str) -> None:
+        """把生成的 HTML 存入 page_version 表"""
+        record = PageVersion(
+            marker=marker,
+            version=version,
+            html_content=html,
+            status=PageStatus.PUBLISHED,
+            created_by=created_by,
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+    def _template_html(self, prompt: str) -> str:
+        """
+        Phase 1 硬编码 HTML 模板，把 prompt 嵌入标题。
+        Phase 2 替换为 LLM 生成的真实 HTML。
+        注意：CSS 里的花括号需要双写 {{}} 以转义 f-string。
+        """
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>生成页面</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    margin: 0; padding: 40px; background: #f5f7fa; color: #333;
+  }}
+  .card {{
+    background: #fff; border-radius: 12px; padding: 32px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.08); max-width: 800px; margin: 0 auto;
+  }}
+  h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a2e; }}
+  p  {{ color: #666; line-height: 1.6; }}
+  .badge {{
+    display: inline-block; background: #e8f4fd; color: #1677ff;
+    padding: 4px 12px; border-radius: 20px; font-size: 13px; margin-top: 16px;
+  }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Hello HTML</h1>
+    <p>你的需求：<strong>{prompt}</strong></p>
+    <p>这是 Phase 1 硬编码模板页面，Phase 2 将接入 LLM 生成真实内容。</p>
+    <span class="badge">Phase 1 · 硬编码原型</span>
+  </div>
+</body>
+</html>"""
+
+
+# 模块级单例
+generation_runner = GenerationRunner()
+```
+
+---
+
+### Step 5：新建 `sinan/api/routes/preview.py`
+
+**做什么**：实现页面预览接口 `GET /api/v1/page/{marker}`。
+
+从 `PageVersion` 表查询该 marker 下 `version` 最大的记录，把 `html_content` 直接以 `text/html` 返回，浏览器打开就能渲染。
+
+**注意点**：
+
+- `order_by(desc(PageVersion.version)).limit(1)` 而不是 `order_by(desc(PageVersion.id))`，因为 version 才是业务版本号，语义更准确。
+- 不存在时返回 404 JSON，而不是抛异常，这样 curl 测试时信息更清晰。
+- `response_class=HTMLResponse` 告诉 FastAPI 和 OpenAPI 文档这个接口返回 HTML，不是 JSON。
+
+```python
+# sinan/api/routes/preview.py
+from fastapi import APIRouter
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import select, desc
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import PageVersion
+
+router = APIRouter()
+
+
+@router.get("/page/{marker}", response_class=HTMLResponse)
+async def preview_page(marker: str):
+    """
+    返回指定 marker 的最新版本 HTML 页面。
+    直接在浏览器渲染，media_type 为 text/html。
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker)
+            .order_by(desc(PageVersion.version))
+            .limit(1)
+        )
+        page = result.scalar_one_or_none()
+
+    if page is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"页面 '{marker}' 不存在"}
+        )
+
+    return HTMLResponse(content=page.html_content)
+```
+
+---
+
+### Step 6：修改 `sinan/api/app.py`
+
+**做什么**：把新增的两个 router 注册进 FastAPI 应用，统一加 `/api/v1` 前缀。
+
+**注意点**：只改 `import` 和 `include_router`，其余逻辑不动。
+
+```python
+# sinan/api/app.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from sinan.config.settings import settings
+from sinan.core.logging import setup_logging
+from sinan.models.database import init_db
+from sinan.api.routes.health import router as health_router
+from sinan.api.routes.generate import router as generate_router
+from sinan.api.routes.preview import router as preview_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging(settings.debug)
+    await init_db()
+    yield
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.include_router(health_router)                          # /health（无前缀）
+    app.include_router(generate_router, prefix="/api/v1")     # /api/v1/generate
+    app.include_router(preview_router, prefix="/api/v1")      # /api/v1/page/{marker}
+    return app
+
+
+app = create_app()
+```
+
+---
+
+### Step 7：修改 `sinan/api/deps.py`
+
+**做什么**：Phase 1 所有服务用模块级单例，路由直接 import，`deps.py` 暂时不需要任何实质内容。留下注释说明设计意图，Phase 2+ 如果需要请求级 db session 注入再来扩充。
+
+```python
+# sinan/api/deps.py
+#
+# Phase 1: 服务以模块级单例暴露，路由直接 import 使用：
+#   from sinan.services.session_store import session_store
+#   from sinan.services.generation_event_bus import event_bus
+#   from sinan.services.generation_runner import generation_runner
+#
+# Phase 2+: 如需请求级 db session 注入，在此添加：
+#   async def get_db() -> AsyncGenerator[AsyncSession, None]:
+#       async with AsyncSessionLocal() as session:
+#           yield session
+```
+
+---
+
+### 1.2 验收标准
+
+```bash
+# 启动服务
+python -m sinan
+
+# 1. 创建任务
+curl -X POST http://localhost:8000/api/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "做一个 GPU 使用率看板", "user_id": "test_user"}'
+# 预期: {"session_id": "xxxxxxxx-...", "status": "running"}
+
+# 2. SSE 订阅（另开终端，替换 SESSION_ID）
+curl -N http://localhost:8000/api/v1/generate/SESSION_ID/stream
+# 预期: 收到 receive / analyze / design / code / verify / host 6 条事件后连接关闭
+
+# 3. 预览页面（取 session_id 前 8 位替换 XXXXXXXX）
+open http://localhost:8000/api/v1/page/page_XXXXXXXX
+# 预期: 浏览器渲染出 "Hello HTML" 页面，显示你输入的 prompt
+```
+
+- [ ] `POST /api/v1/generate` 返回 `session_id`，接口立即返回不阻塞
+- [ ] SSE 流推送 6 条事件（receive / analyze / design / code / verify / host）后连接自动关闭
+- [ ] `GET /api/v1/page/{marker}` 浏览器可直接渲染 HTML 页面
+- [ ] `gen_session` 表：`status = completed`，`marker` 和 `preview_url` 有值
+- [ ] `gen_session_step` 表：5 条步骤记录（receive/analyze/design/code/verify）
+- [ ] `page_version` 表：1 条记录，`html_content` 有完整 HTML 内容
+- [ ] **端到端跑通，能在浏览器看到一个 HTML 页面**
 
 ---
 

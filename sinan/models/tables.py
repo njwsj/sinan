@@ -13,7 +13,8 @@ class GenSession(Base):
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="用户ID")
     prompt: Mapped[str] = mapped_column(Text, nullable=False, comment="用户需求描述")
     status: Mapped[SessionStatus] = mapped_column(
-        SAEnum(SessionStatus), default=SessionStatus.PENDING, comment="会话状态"
+        SAEnum(SessionStatus, values_callable=lambda x: [e.value for e in x]),
+        default=SessionStatus.PENDING, comment="会话状态"
     )
     current_step: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="当前执行步骤")
     iteration: Mapped[int] = mapped_column(Integer, default=0, comment="修复迭代次数")
@@ -69,7 +70,8 @@ class PageVersion(Base):
     html_content: Mapped[str | None] = mapped_column(Text, nullable=True, comment="生成的 HTML 内容")
     source_code: Mapped[str | None] = mapped_column(Text, nullable=True, comment="页面源代码")
     status: Mapped[PageStatus] = mapped_column(
-        SAEnum(PageStatus), default=PageStatus.DRAFT, comment="页面状态"
+        SAEnum(PageStatus, values_callable=lambda x: [e.value for e in x]),
+        default=PageStatus.DRAFT, comment="页面状态"
     )
     owner: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="页面所有者")
     created_by: Mapped[str] = mapped_column(String(64), nullable=False, comment="创建人ID")
