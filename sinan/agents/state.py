@@ -20,3 +20,8 @@ class PageGenState(TypedDict):
     # Verifier 产出
     verified: bool          # 是否通过验证
     verify_message: str     # 验证结论或错误描述
+
+    # Phase 4 新增：Harness 控制字段
+    iteration: int  # 当前修复迭代次数（从 0 开始）
+    max_iterations: int  # 最大允许修复次数（默认 3）
+    gate_decision: str  # 当前门禁决策（proceed/retry/fix/block）
