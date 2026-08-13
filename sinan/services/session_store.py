@@ -11,7 +11,7 @@ class SessionStore:
         """创建新 session，写入数据库，返回 ORM 对象"""
         session_id = str(uuid.uuid4())
         session = GenSession(
-            id=session_id,
+            session_id=session_id,
             user_id=user_id,
             prompt=prompt,
             status=SessionStatus.PENDING,
@@ -26,7 +26,7 @@ class SessionStore:
         """按 ID 查询 session，不存在返回 None"""
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(GenSession).where(GenSession.id == session_id)
+                select(GenSession).where(GenSession.session_id == session_id)
             )
             return result.scalar_one_or_none()
 
@@ -37,7 +37,7 @@ class SessionStore:
         """
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(GenSession).where(GenSession.id == session_id)
+                select(GenSession).where(GenSession.session_id == session_id)
             )
             session = result.scalar_one_or_none()
             if session is None:

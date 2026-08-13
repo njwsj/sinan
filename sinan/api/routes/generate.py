@@ -33,8 +33,8 @@ async def create_generation(
     """
     session = await session_store.create(user_id=user_id, prompt=prompt)
     # create_task 把 runner 扔到事件循环后台，不阻塞当前请求
-    asyncio.create_task(generation_runner.start(session.id))
-    return {"session_id": session.id, "status": "running"}
+    asyncio.create_task(generation_runner.start(session.session_id))
+    return {"session_id": session.session_id, "status": "running"}
 
 
 @router.get("/generate/{session_id}/stream")

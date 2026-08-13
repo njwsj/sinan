@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 from sinan.agents.coder import CoderAgent
+from sinan.agents.graph import build_graph
 from sinan.agents.llm import LLMClient
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import GenSessionStep, PageVersion
@@ -15,14 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 class GenerationRunner:
-    """
-        Phase 2：用真实 LLM 调用替换 Phase 1 的硬编码模板。
-        流程：receive → code（LLM 生成）→ verify → host
-        """
 
-    def __init__(self, llm: LLMClient, coder: CoderAgent):
+
+    def __init__(self, llm: LLMClient):
         self.llm = llm
-        self.coder = coder
+        self.graph = build_graph(llm)
 
     async def start(self, session_id: str) -> None:
         """
@@ -32,22 +30,33 @@ class GenerationRunner:
         await session_store.update(session_id, status=SessionStatus.RUNNING)
 
         try:
-            # 步骤 1：接收需求
-            await event_bus.publish(session_id, "receive", {"message": "正在接收需求..."})
-            await self._write_step(session_id, "receive", "正在接收需求...")
-
-            # 获取用户输入的 prompt
             session = await session_store.get(session_id)
             prompt = session.prompt if session else ""
 
-            # 步骤 2：LLM 生成 HTML（耗时步骤，先推事件告知前端）
-            await event_bus.publish(session_id, "code", {"message": "AI 正在生成页面，请稍候..."})
-            html = await self.coder.generate(prompt)
-            await self._write_step(session_id, "code", "AI 生成完成")
+            # 步骤事件：analyze
+            await event_bus.publish(session_id, "analyze", {"message": "正在分析需求..."})
+            await self._write_step(session_id, "analyze", "开始需求分析")
 
-            # 步骤 3：验证通过
-            await event_bus.publish(session_id, "verify", {"message": "验证通过"})
-            await self._write_step(session_id, "verify", "验证通过")
+            # 步骤事件：design
+            await event_bus.publish(session_id, "design", {"message": "正在制定设计方案..."})
+            await self._write_step(session_id, "design", "开始设计")
+
+            # 步骤事件：code
+            await event_bus.publish(session_id, "code", {"message": "AI 正在生成页面代码..."})
+            await self._write_step(session_id, "code", "开始生成")
+
+            # 执行 LangGraph 图（内部串行执行 analyze → design → code → verify）
+            final_state = await self.graph.ainvoke({"prompt": prompt})
+
+            await self._write_step(session_id, "verify", final_state["verify_message"])
+            await event_bus.publish(
+                session_id, "verify", {"message": final_state["verify_message"]}
+            )
+
+            if not final_state["verified"]:
+                raise ValueError(final_state["verify_message"])
+
+            html = final_state["html"]
 
         except Exception as e:
             logger.exception("generation failed for session %s", session_id)
@@ -108,5 +117,4 @@ _llm = LLMClient(
     model=settings.llm_model,
     base_url=settings.llm_base_url,
 )
-_coder = CoderAgent(_llm)
-generation_runner = GenerationRunner(_llm, _coder)
+generation_runner = GenerationRunner(_llm)
