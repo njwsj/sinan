@@ -930,24 +930,6 @@ open http://localhost:8000/api/v1/page/page_XXXXXXXX
 - [ ] `page_version` 表：1 条记录，`html_content` 有完整 HTML 内容
 - [ ] **端到端跑通，能在浏览器看到一个 HTML 页面**
 
-### 1.3 总结
-
-#### 1.3.1 phase1 流程
-
-- 首先调用`/api/v1/generate`接口
-  - 调用SessionStore.create方法（生成session，并存入**GenSession**表中）
-  - 使用返回的session.id 调用generation_runner.start(session.id)
-    - 更新GenSession表中该session.id的状态为RUNNING
-    - 全局定义html变量
-    - 遍历定义的steps（receive、analyze等）
-      - 每个step都event_bus.publish(session_id, step_name, {"message": message})，放到内部维护的`dict[session_id → asyncio.Queue]`（session_id → asyncio.Queue[GenerationEvent | _SENTINEL]）以供`/api/v1/generate/{{session_id}}/stream`接口动态获取
-      - 每个step都调用_write_step(session_id, step_name, message)将步骤执行记录写入 **gen_session_step** 表
-      - 当step为code阶段时，生成html
-    - 遍历完成，将生成的全局变量html代码保存到**PageVersion**表中
-    - 将该session_id的GenSession表记录的状态更新为COMPLETED
-    - event_bus.publish「页面已生成」信息
-    - event_bus.publish_done(session_id) 向队列加入一个哨兵节点，关闭 SSE 流
-
 ---
 
 ## 五、Phase 2：接入 LLM — 让 AI 生成页面
@@ -956,99 +938,455 @@ open http://localhost:8000/api/v1/page/page_XXXXXXXX
 
 **预计工时**：2-3 天
 
-### 2.1 LLM 封装
+**涉及文件变动**：
+
+```
+sinan/
+├── agents/
+│   ├── __init__.py          ← Step 3：新建（空文件，让目录成为 Python 包）
+│   ├── llm.py               ← Step 4：新建（LLM 客户端封装）
+│   └── coder.py             ← Step 5：新建（单步 Coder Agent）
+└── services/
+    └── generation_runner.py ← Step 6：修改（替换硬编码为真实 LLM 调用）
+```
+
+---
+
+### Step 1：确认依赖已就绪（无需操作）
+
+`requirements.txt` 里已经有 `httpx>=0.27.0` 和 `tenacity>=9.0.0`，不需要新增。
+
+只需确认已安装到当前环境：
+
+```bash
+pip show httpx tenacity
+```
+
+两个包都有输出（显示 Name/Version）说明就绪。如果提示 `Package(s) not found`，执行：
+
+```bash
+pip install httpx tenacity
+```
+
+---
+
+### Step 2：填写 `.env` 里的 `LLM_API_KEY`
+
+**为什么先做这步**：`llm.py` 写好后第一件事就是测试能否跑通，key 没填的话测试直接收到 401，浪费排查时间。
+
+打开项目根目录的 `.env` 文件，找到这一行：
+
+```
+LLM_API_KEY=
+```
+
+改为：
+
+```
+LLM_API_KEY=你在智谱开放平台申请的真实 key
+```
+
+其余配置已经正确，不需要改：
+
+```
+LLM_MODEL=glm-4
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+```
+
+---
+
+### Step 3：创建 `sinan/agents/` 目录和 `__init__.py`
+
+`sinan/` 下目前没有 `agents/` 目录。Phase 2 开始把 LLM 封装和 Agent 都放在这里，与 Phase 3 的多 Agent 体系保持一致。
+
+新建两个文件：
+
+**`sinan/agents/__init__.py`**（空文件）：
 
 ```python
-# page_gen/agents/llm.py
+```
+
+（内容为空，让 Python 把这个目录识别为包。）
+
+---
+
+### Step 4：新建 `sinan/agents/llm.py`
+
+**设计说明**：
+
+- **为什么用 `httpx` 而不是官方 SDK**：智谱官方 Python SDK 是同步的，整个项目是 `asyncio` 异步体系，同步调用会阻塞事件循环，必须用异步 HTTP 客户端直接调。
+- **为什么用 `tenacity` 重试**：LLM API 偶发超时或 5xx 是正常现象。失败后等 1 秒重试，最多 3 次（含第一次），不会因偶发抖动让整个流程失败。`reraise=True` 表示 3 次全部失败后把原始异常向上抛，让调用方处理。
+- **`timeout=120`**：`glm-4` 生成复杂 HTML 可能需要 30-60 秒，默认 5 秒超时会直接报错，120 秒是保守值。
+- **`LLMClient` 不做单例**：它只持有配置，不持有连接，每次调用时新建 `httpx.AsyncClient`。单例由上层 `generation_runner.py` 管理。
+
+**文件：`sinan/agents/llm.py`**
+
+```python
+# sinan/agents/llm.py
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+
 class LLMClient:
+    """
+    智谱 API 的异步封装。
+    使用 httpx 直接调用 /chat/completions，tenacity 做自动重试。
+    """
+
     def __init__(self, api_key: str, model: str, base_url: str):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     async def chat(self, messages: list[dict], temperature: float = 0.7) -> str:
-        async with httpx.AsyncClient() as client:
+        """
+        发送 chat 请求，返回模型回复的文本内容。
+        失败时自动重试，最多 3 次，每次等待 1-10 秒。
+        reraise=True 表示 3 次全部失败后把原始异常向上抛，让调用方处理。
+        """
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
                 json={
                     "model": self.model,
                     "messages": messages,
                     "temperature": temperature,
                 },
-                timeout=120,
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
 ```
 
-### 2.2 单步 Coder Agent
+---
+
+### Step 5：新建 `sinan/agents/coder.py`
+
+**设计说明**：
+
+- **System prompt 要明确说"返回纯 HTML"**：LLM 默认会把代码包在 ` ```html ... ``` ` 里，这是 Markdown 格式，直接存入数据库再渲染会显示原始字符串。必须在 prompt 里明确禁止，并在代码里再做一次剥离兜底。
+- **`_strip_markdown` 覆盖多种变体**：LLM 输出不稳定，有时是 ` ```html\n`，有时是 ` ```HTML\n`，代码里覆盖了常见情况。
+- **`temperature=0.3`**：生成代码场景用低温度，减少随机性，让输出更符合 HTML 语法规范。
+- **System prompt 要求用 ECharts 做图表**：生成的 HTML 自动引入 ECharts CDN，适合做数据看板类需求，与 Phase 3 多 Agent 体系保持一致。
+
+**文件：`sinan/agents/coder.py`**
 
 ```python
-# page_gen/agents/coder.py（Phase 2 简化版）
+# sinan/agents/coder.py
+from sinan.agents.llm import LLMClient
+
+
 class CoderAgent:
+    """
+    Phase 2 单步 Coder：直接把用户描述翻译成 HTML 页面。
+    Phase 3 会拆成 Analyzer → Designer → Coder → Verifier → Fixer 多步流水线。
+    """
+
     def __init__(self, llm: LLMClient):
         self.llm = llm
 
     async def generate(self, prompt: str) -> str:
-        """根据用户描述直接生成 HTML"""
-        system_prompt = """你是一个前端页面生成专家。
-根据用户需求生成完整的 HTML 页面（内联 CSS 和 JS）。
+        """
+        根据用户描述生成完整 HTML 页面。
+        返回去除 markdown 包裹的纯 HTML 字符串。
+        """
+        system_prompt = """你是一个专业的前端页面生成专家。
+根据用户的需求，生成一个完整、可直接在浏览器运行的 HTML 页面。
+
 要求：
-1. 使用 ECharts 做图表
-2. 响应式布局
-3. 现代化 UI 风格
-4. 返回纯 HTML，不要 markdown 代码块
+1. 返回纯 HTML 文本，不要任何 markdown 格式（不要 ```html 代码块）
+2. 所有 CSS 和 JavaScript 都内联在 HTML 文件里，不引用外部本地文件
+3. 需要图表时使用 ECharts（通过 CDN 引入：https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js）
+4. 使用响应式布局，适配不同屏幕宽度
+5. 使用现代化 UI 风格，配色专业
+6. 页面需要有真实的示例数据，不要空占位符
 """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
+
         html = await self.llm.chat(messages, temperature=0.3)
-        # 去除可能的 markdown 包裹
-        if html.startswith("```html"):
-            html = html[7:]
-        if html.endswith("```"):
-            html = html[:-3]
-        return html.strip()
+        html = self._strip_markdown(html)
+        return html
+
+    def _strip_markdown(self, text: str) -> str:
+        """去除 LLM 可能在 HTML 外面套的 markdown 代码块包裹。"""
+        text = text.strip()
+
+        # 处理 ```html 或 ```HTML 开头
+        for prefix in ("```html\n", "```HTML\n", "```html", "```HTML"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+
+        # 处理结尾的 ```
+        if text.endswith("```"):
+            text = text[:-3]
+
+        return text.strip()
 ```
 
-### 2.3 改造 GenerationRunner
+---
+
+### Step 6：修改 `sinan/services/generation_runner.py`
+
+**改动点说明**：
+
+1. **构造函数新增 `llm` 和 `coder` 参数**：Runner 不负责创建 LLM 客户端，由外部注入（依赖注入），方便测试和未来替换。
+2. **步骤精简为 3 步**：`receive`（接收需求）→ `code`（AI 生成中）→ `verify`（完成）。原来 Phase 1 的 `analyze` 和 `design` 是假步骤，去掉更诚实，Phase 3 会有真实的多 Agent 步骤。
+3. **`code` 步骤调 `await self.coder.generate(prompt)`**：真实 LLM 调用，会阻塞 30-60 秒。在调用之前先推一次 `code` 事件告诉前端"AI 正在生成"，让用户知道在等待而不是卡死。
+4. **加 `try/except` 错误处理**：LLM 调用可能因 key 无效、网络超时、API 限流等失败。失败时：推送 `error` 事件（前端展示错误提示）、更新 session 状态为 `FAILED`、调用 `publish_done` 关闭 SSE 流（否则前端会一直挂着等待）。
+5. **模块底部单例初始化方式改变**：Phase 1 是 `GenerationRunner()`（无参数）。Phase 2 把 `settings` 里的配置传进去，初始化 `LLMClient` 和 `CoderAgent`。
+
+**完整文件 `sinan/services/generation_runner.py`**（替换 Phase 1 的版本）：
 
 ```python
-# Phase 2: 替换硬编码为真实 LLM 调用
+# sinan/services/generation_runner.py
+import asyncio
+import logging
+
+from sinan.agents.coder import CoderAgent
+from sinan.agents.llm import LLMClient
+from sinan.config.settings import settings
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.enums import PageStatus, SessionStatus
+from sinan.models.tables import GenSessionStep, PageVersion
+from sinan.services.generation_event_bus import event_bus
+from sinan.services.session_store import session_store
+
+logger = logging.getLogger(__name__)
+
+
 class GenerationRunner:
+    """
+    Phase 2：用真实 LLM 调用替换 Phase 1 的硬编码模板。
+    流程：receive → code（LLM 生成）→ verify → host
+    """
+
     def __init__(self, llm: LLMClient, coder: CoderAgent):
         self.llm = llm
         self.coder = coder
 
-    async def start(self, session_id: str):
-        session = await session_store.get(session_id)
-        await self._emit(session_id, "receive", "正在接收需求...")
+    async def start(self, session_id: str) -> None:
+        """
+        后台异步执行生成流程。
+        由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
+        """
+        await session_store.update(session_id, status=SessionStatus.RUNNING)
 
-        # 真实 LLM 生成
-        await self._emit(session_id, "code", "AI 正在生成页面...")
-        html = await self.coder.generate(session.prompt)
+        try:
+            # 步骤 1：接收需求
+            await event_bus.publish(session_id, "receive", {"message": "正在接收需求..."})
+            await self._write_step(session_id, "receive", "正在接收需求...")
 
-        await self._emit(session_id, "verify", "验证通过")
+            # 获取用户输入的 prompt
+            session = await session_store.get(session_id)
+            prompt = session.prompt if session else ""
+
+            # 步骤 2：LLM 生成 HTML（耗时步骤，先推事件告知前端）
+            await event_bus.publish(session_id, "code", {"message": "AI 正在生成页面，请稍候..."})
+            html = await self.coder.generate(prompt)
+            await self._write_step(session_id, "code", "AI 生成完成")
+
+            # 步骤 3：验证通过
+            await event_bus.publish(session_id, "verify", {"message": "验证通过"})
+            await self._write_step(session_id, "verify", "验证通过")
+
+        except Exception as e:
+            logger.exception("generation failed for session %s", session_id)
+            await event_bus.publish(session_id, "error", {"message": f"生成失败：{e}"})
+            await session_store.update(session_id, status=SessionStatus.FAILED)
+            await event_bus.publish_done(session_id)
+            return
+
+        # 托管：写 page_version 表，更新 session
         marker = f"page_{session_id[:8]}"
         version = 1
-        await page_store.save(marker, version, html)
-        await self._emit(session_id, "host", f"已托管: /page/{marker}")
-        await session_store.update(session_id, status="completed",
-                                    marker=marker, version=version)
+        await self._save_page(marker, version, html, created_by=session_id)
+        await session_store.update(
+            session_id,
+            status=SessionStatus.COMPLETED,
+            marker=marker,
+            version=version,
+            preview_url=f"/api/v1/page/{marker}",
+        )
+
+        # 推送托管完成事件，再关闭 SSE 流
+        await event_bus.publish(
+            session_id,
+            "host",
+            {
+                "message": f"页面已生成，预览地址: /api/v1/page/{marker}",
+                "url": f"/api/v1/page/{marker}",
+            },
+        )
+        await event_bus.publish_done(session_id)
+
+    async def _write_step(self, session_id: str, step: str, message: str) -> None:
+        """把步骤执行记录写入 gen_session_step 表。"""
+        record = GenSessionStep(
+            session_id=session_id,
+            step=step,
+            direction="output",
+            output_data={"message": message},
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+    async def _save_page(self, marker: str, version: int, html: str, created_by: str) -> None:
+        """把生成的 HTML 存入 page_version 表。"""
+        record = PageVersion(
+            marker=marker,
+            version=version,
+            html_content=html,
+            status=PageStatus.PUBLISHED,
+            created_by=created_by,
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+
+# 模块级单例：用 settings 里的配置初始化 LLM 和 CoderAgent
+_llm = LLMClient(
+    api_key=settings.llm_api_key,
+    model=settings.llm_model,
+    base_url=settings.llm_base_url,
+)
+_coder = CoderAgent(_llm)
+generation_runner = GenerationRunner(_llm, _coder)
 ```
+
+---
+
+### Step 7：端到端验证
+
+**7.1 先单独测 LLM 连通性**
+
+在项目根目录新建临时测试脚本（验完删掉）：
+
+```python
+# test_llm.py（临时脚本，验完删掉）
+import asyncio
+from sinan.agents.llm import LLMClient
+from sinan.config.settings import settings
+
+async def main():
+    client = LLMClient(settings.llm_api_key, settings.llm_model, settings.llm_base_url)
+    result = await client.chat([{"role": "user", "content": "说一句话：你好"}])
+    print(result)
+
+asyncio.run(main())
+```
+
+```bash
+python test_llm.py
+```
+
+预期结果：打印出 LLM 的回复，例如"你好！有什么我可以帮助你的？"  
+报 401 → `LLM_API_KEY` 没填对，回到 Step 2  
+报 ConnectError/超时 → 网络问题，检查 `LLM_BASE_URL` 是否可达
+
+**7.2 单独测 CoderAgent**
+
+```python
+# test_coder.py（临时脚本，验完删掉）
+import asyncio
+from sinan.agents.llm import LLMClient
+from sinan.agents.coder import CoderAgent
+from sinan.config.settings import settings
+
+async def main():
+    llm = LLMClient(settings.llm_api_key, settings.llm_model, settings.llm_base_url)
+    coder = CoderAgent(llm)
+    html = await coder.generate("做一个简单的 Hello World 页面")
+    print(html[:500])  # 打印前 500 字符
+    print("---")
+    print("是否以 <!DOCTYPE 开头:", html.strip().startswith("<!DOCTYPE"))
+
+asyncio.run(main())
+```
+
+预期结果：打印出 HTML 前 500 字符，且最后一行打印 `True`（说明 markdown 剥离成功）  
+最后一行打印 `False` → LLM 还是包了 markdown，看实际输出格式，调整 `_strip_markdown` 里的 prefix 列表
+
+**7.3 启动服务，跑完整流程**
+
+```bash
+sinan serve
+```
+
+另开终端，发起生成请求：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "做一个 GPU 使用率监控看板"}'
+```
+
+拿到 `session_id`，连 SSE 流：
+
+```bash
+curl -N http://localhost:8000/api/v1/generate/{session_id}/stream
+```
+
+预期的 SSE 事件顺序：
+
+```
+event: receive
+data: {"message": "正在接收需求..."}
+
+event: code
+data: {"message": "AI 正在生成页面，请稍候..."}
+
+（等待 30-60 秒，LLM 生成中）
+
+event: verify
+data: {"message": "验证通过"}
+
+event: host
+data: {"message": "页面已生成，预览地址: /api/v1/page/page_xxxxxxxx", "url": "/api/v1/page/page_xxxxxxxx"}
+```
+
+**7.4 浏览器预览**
+
+拿到 host 事件里的 `url`，浏览器打开：
+
+```
+http://localhost:8000/api/v1/page/page_xxxxxxxx
+```
+
+看到 AI 生成的真实 HTML 页面，Phase 2 验收完成。
+
+---
+
+### 常见坑
+
+| 坑 | 说明 |
+|----|------|
+| LLM 超时 | `glm-4` 生成复杂 HTML 可能要 30-60 秒，`timeout` 不够会断连 |
+| SSE 提前关闭 | 前端如果 30 秒内没收到事件会断开，LLM 生成期间可以每隔几秒推一个 `ping` 事件保活 |
+| HTML 里有 markdown 包裹 | `_strip_markdown` 要覆盖 ` ```html\n` 和 ` ```\n` 的变体 |
+| `settings.llm_api_key` 为空 | 没填 `.env` 的话，httpx 报 401 |
+
+---
 
 ### 2.4 验收标准
 
 - [ ] 输入"做一个 GPU 使用率看板"，AI 返回真实 HTML 页面
-- [ ] SSE 流推送生成进度
+- [ ] SSE 流按顺序推送 `receive` → `code` → `verify` → `host` 事件
+- [ ] LLM 调用失败时推送 `error` 事件，session 状态变为 `FAILED`，SSE 流正常关闭
 - [ ] 页面可在浏览器中预览
-- [ ] LLM 调用失败时有错误处理和重试
 - [ ] **端到端跑通：自然语言 → AI 生成 → 预览页面**
 
 ---
