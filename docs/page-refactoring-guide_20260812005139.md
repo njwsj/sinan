@@ -1393,289 +1393,469 @@ http://localhost:8000/api/v1/page/page_xxxxxxxx
 
 ## 六、Phase 3：LangGraph 多 Agent 编排
 
-**目标**：将单步 LLM 调用升级为 Analyzer→Designer→Coder→Verifier→Fixer 多 Agent 流程，使用 LangGraph 状态图编排。
+**目标**：把现在 `CoderAgent` 的单步生成，拆成 `Analyzer → Designer → Coder → Verifier` 四个串行 Agent 节点，用 LangGraph 编排。
 
-**预计工时**：5-7 天
+---
 
-### 3.1 安装 LangGraph
+### Step 1：安装依赖
+
+在 `requirements.txt` 里加入 LangGraph：
+
+```
+langgraph>=0.2.0
+```
+
+然后执行：
 
 ```bash
-pip install langgraph>=0.2.0 langchain-core>=0.3.0 langgraph-checkpoint-mysql>=3.0.0
+pip install langgraph
 ```
 
-### 3.2 状态定义（参考原项目 state.py）
+**说明**：LangGraph 是 LangChain 生态下的图编排框架，用有向图描述 Agent 之间的流转关系。`langgraph>=0.2.0` 这个版本引入了 `StateGraph`，API 稳定。
+
+---
+
+### Step 2：定义共享状态（State）
+
+新建文件 `sinan/agents/state.py`：
 
 ```python
-# page_gen/agents/state.py
-from typing import TypedDict, List, Optional
+# sinan/agents/state.py
+from typing import TypedDict
 
-class GenerationState(TypedDict):
-    # 用户输入
-    session_id: str
-    user_id: str
+
+class PageGenState(TypedDict):
+    """LangGraph 节点之间共享的流水线状态。"""
+
+    # 输入
     prompt: str
-    attachments: List[dict]
 
-    # 步骤产出
-    requirement_doc: Optional[dict]      # Analyzer 输出
-    design_spec: Optional[dict]          # Designer 输出
-    html_code: Optional[str]             # Coder 输出
-    verify_report: Optional[dict]        # Verifier 输出
-    fix_history: List[dict]              # 修复历史
+    # Analyzer 产出
+    requirements: str       # 结构化需求：功能列表、交互要点
 
-    # 流程控制
-    current_step: str
-    iteration: int
-    max_iterations: int                  # 默认 3
-    status: str                          # running|completed|failed|awaiting_input
+    # Designer 产出
+    design: str             # 设计方案：布局结构、配色方案、组件清单
 
-    # 托管结果
-    marker: Optional[str]
-    version: Optional[int]
-    preview_url: Optional[str]
+    # Coder 产出
+    html: str               # 生成的 HTML 页面
 
-    # 统计
-    total_tokens: int
-    total_duration_ms: int
+    # Verifier 产出
+    verified: bool          # 是否通过验证
+    verify_message: str     # 验证结论或错误描述
 ```
 
-### 3.3 构建 LangGraph 状态图（参考原项目 graph.py）
+**说明**：LangGraph 的 `StateGraph` 要求你先定义一个 `TypedDict` 作为节点间传递的"共享黑板"。每个节点接收完整 state，返回它要更新的字段（dict），框架会自动合并。
+
+---
+
+### Step 3：实现 Analyzer Agent
+
+新建文件 `sinan/agents/analyzer.py`：
 
 ```python
-# page_gen/agents/graph.py
-from langgraph.graph import StateGraph, END
+# sinan/agents/analyzer.py
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
 
-def build_generation_graph(llm: LLMClient):
+SYSTEM_PROMPT = """你是一个需求分析专家。
+分析用户的页面需求，输出结构化的需求清单。
+
+输出格式（纯文本，不要 markdown）：
+1. 核心功能列表（每条一行）
+2. 数据展示要求
+3. 交互要点
+4. 特殊约束（如：必须用 ECharts、响应式等）
+
+直接输出分析结果，不要任何前缀说明。"""
+
+
+class AnalyzerAgent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    async def run(self, state: PageGenState) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": state["prompt"]},
+        ]
+        requirements = await self.llm.chat(messages, temperature=0.3)
+        return {"requirements": requirements}
+```
+
+**说明**：每个 Agent 的 `run` 方法接收完整 state，只返回它负责更新的字段（这里是 `requirements`）。温度用 0.3 保证分析结果确定性。
+
+---
+
+### Step 4：实现 Designer Agent
+
+新建文件 `sinan/agents/designer.py`：
+
+```python
+# sinan/agents/designer.py
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
+
+SYSTEM_PROMPT = """你是一个前端 UI 设计师。
+根据需求分析结果，输出具体的页面设计方案。
+
+输出格式（纯文本，不要 markdown）：
+1. 整体布局描述（如：顶部导航 + 左侧面板 + 右侧主区域）
+2. 配色方案（主色、辅色、背景色的具体十六进制值）
+3. 组件清单（每个组件一行，说明用途和位置）
+4. 数据展示方式（表格/图表/卡片，及图表类型）
+
+直接输出设计方案，不要任何前缀说明。"""
+
+
+class DesignerAgent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    async def run(self, state: PageGenState) -> dict:
+        user_content = f"用户需求：\n{state['prompt']}\n\n需求分析：\n{state['requirements']}"
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        design = await self.llm.chat(messages, temperature=0.5)
+        return {"design": design}
+```
+
+**说明**：Designer 同时读取原始 `prompt` 和 Analyzer 输出的 `requirements`，让设计方案有完整上下文。
+
+---
+
+### Step 5：改造 Coder Agent
+
+用 LangGraph 节点格式改写 `sinan/agents/coder.py`（保留原有 `_strip_markdown`，改造 `generate` → `run`）：
+
+```python
+# sinan/agents/coder.py
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
+
+SYSTEM_PROMPT = """你是一个前端页面生成专家。
+根据需求分析和设计方案，生成一个完整的、可直接在浏览器运行的 HTML 页面。
+
+要求：
+1. 页面必须是完整的 HTML 文档，包含 <!DOCTYPE html>、<head>、<body>
+2. CSS 全部内联在 <style> 标签中，不依赖外部 CSS 文件
+3. JavaScript 全部内联在 <script> 标签中
+4. 如果需要图表，使用 ECharts（通过 CDN 引入：https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js）
+5. 响应式布局，适配不同屏幕宽度
+6. 现代化 UI 风格，配色协调，有适当的间距和层次感
+7. 只返回纯 HTML 代码，不要任何 markdown 格式（不要 ```html 包裹）
+8. 不要任何解释文字，直接输出 HTML"""
+
+
+class CoderAgent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    async def run(self, state: PageGenState) -> dict:
+        user_content = (
+            f"用户需求：\n{state['prompt']}\n\n"
+            f"需求分析：\n{state['requirements']}\n\n"
+            f"设计方案：\n{state['design']}"
+        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        html = await self.llm.chat(messages, temperature=0.3)
+        return {"html": self._strip_markdown(html)}
+
+    def _strip_markdown(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```html"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
+```
+
+**说明**：Coder 现在拿到三个上下文（prompt + requirements + design），生成质量更高。`generate` 方法改名为 `run` 以统一节点接口。
+
+---
+
+### Step 6：实现 Verifier Agent
+
+新建文件 `sinan/agents/verifier.py`：
+
+```python
+# sinan/agents/verifier.py
+from sinan.agents.state import PageGenState
+
+
+class VerifierAgent:
+    """
+    轻量级 HTML 结构校验，不调用 LLM。
+    只做必要性检查：有 DOCTYPE、有 html 标签、有 body 标签、长度达标。
+    """
+
+    MIN_HTML_LENGTH = 200
+
+    async def run(self, state: PageGenState) -> dict:
+        html = state.get("html", "")
+        errors = []
+
+        if "<!DOCTYPE html>" not in html.upper()[:200]:
+            errors.append("缺少 <!DOCTYPE html>")
+        if "<html" not in html.lower():
+            errors.append("缺少 <html> 标签")
+        if "<body" not in html.lower():
+            errors.append("缺少 <body> 标签")
+        if len(html) < self.MIN_HTML_LENGTH:
+            errors.append(f"HTML 内容过短（{len(html)} 字符），疑似生成失败")
+
+        if errors:
+            return {"verified": False, "verify_message": "；".join(errors)}
+        return {"verified": True, "verify_message": "校验通过"}
+```
+
+**说明**：Phase 3 的 Verifier 用规则校验（不消耗 token），Phase 4 可以升级成 LLM-based 校验。这里不抛异常，只设 `verified` 标志，由图的条件边决定后续走向。
+
+---
+
+### Step 7：用 LangGraph 组装图
+
+新建文件 `sinan/agents/graph.py`：
+
+```python
+# sinan/agents/graph.py
+from langgraph.graph import StateGraph, END
+from sinan.agents.state import PageGenState
+from sinan.agents.analyzer import AnalyzerAgent
+from sinan.agents.designer import DesignerAgent
+from sinan.agents.coder import CoderAgent
+from sinan.agents.verifier import VerifierAgent
+from sinan.agents.llm import LLMClient
+
+
+def build_graph(llm: LLMClient) -> StateGraph:
     analyzer = AnalyzerAgent(llm)
     designer = DesignerAgent(llm)
     coder = CoderAgent(llm)
     verifier = VerifierAgent()
-    fixer = FixerAgent(llm)
 
-    graph = StateGraph(GenerationState)
+    graph = StateGraph(PageGenState)
 
-    # 添加节点
+    # 注册节点：节点名 → 异步函数（接收 state，返回更新 dict）
     graph.add_node("analyze", analyzer.run)
     graph.add_node("design", designer.run)
     graph.add_node("code", coder.run)
     graph.add_node("verify", verifier.run)
-    graph.add_node("fix", fixer.run)
-    graph.add_node("host", host_page)
 
-    # 定义边
+    # 串行边
     graph.set_entry_point("analyze")
     graph.add_edge("analyze", "design")
     graph.add_edge("design", "code")
     graph.add_edge("code", "verify")
 
-    # 条件边：验证结果决定下一步
-    def route_verify(state: GenerationState) -> str:
-        if state["verify_report"]["passed"]:
-            return "host"
-        if state["iteration"] < state["max_iterations"]:
-            return "fix"
-        return END  # 超过最大次数，标记失败
-
-    graph.add_conditional_edges("verify", route_verify, {
-        "host": "host",
-        "fix": "fix",
-        END: END,
-    })
-    graph.add_edge("fix", "code")    # 修复后重新生成代码
-    graph.add_edge("host", END)
+    # 条件边：验证通过 → END，验证失败 → 直接 END（Phase 3 不做修复，Phase 4 接 Fixer）
+    graph.add_conditional_edges(
+        "verify",
+        lambda state: "end" if state["verified"] else "end",  # Phase 4 改为走 fixer
+        {"end": END},
+    )
 
     return graph.compile()
 ```
 
-### 3.4 各 Agent 实现
+**说明**：`StateGraph` 的工作流：注册节点 → 连边 → `compile()` 生成可执行图。`add_conditional_edges` 是扩展点，Phase 4 把 lambda 里的 `"end"` 改成 `"fix"` 就能接入 Fixer。
+
+---
+
+### Step 8：更新 GenerationRunner
+
+用图执行替换单步 `CoderAgent` 调用，修改 `sinan/services/generation_runner.py`：
 
 ```python
-# page_gen/agents/analyst.py
-class AnalyzerAgent:
-    """需求分析：解析用户描述，生成结构化需求文档"""
-    def __init__(self, llm: LLMClient):
-        self.llm = llm
+# sinan/services/generation_runner.py
+import logging
+from sinan.agents.llm import LLMClient
+from sinan.agents.graph import build_graph
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import GenSessionStep, PageVersion
+from sinan.models.enums import SessionStatus, PageStatus
+from sinan.services.session_store import session_store
+from sinan.services.generation_event_bus import event_bus
+from sinan.config.settings import settings
 
-    async def run(self, state: GenerationState) -> dict:
-        prompt = f"""分析以下页面需求，输出结构化 JSON：
-{state['prompt']}
+logger = logging.getLogger(__name__)
 
-输出格式：
-{{
-  "appName": "应用名称",
-  "appDescription": "描述",
-  "pageType": "dashboard|form|list|detail|landing",
-  "targetUser": "目标用户",
-  "dataSource": {{"type": "static", "description": "数据说明"}},
-  "pageStructure": {{
-    "layout": "布局描述",
-    "regions": [{{"id": "xxx", "type": "header|kpi_group|chart_group|data_table", "components": [...]}}]
-  }},
-  "styleSpec": {{"theme": "light", "primaryColor": "#4f6ef7", "chartLibrary": "ECharts"}},
-  "acceptanceCriteria": ["验收标准1", "验收标准2"]
-}}"""
-        result = await self.llm.chat([
-            {"role": "system", "content": "你是需求分析专家，输出 JSON。"},
-            {"role": "user", "content": prompt}
-        ], temperature=0.2)
-        return {"requirement_doc": json.loads(result), "current_step": "analyze"}
-```
-
-```python
-# page_gen/agents/designer.py
-class DesignerAgent:
-    """页面设计：基于需求文档生成布局设计稿"""
-    def __init__(self, llm: LLMClient):
-        self.llm = llm
-
-    async def run(self, state: GenerationState) -> dict:
-        prompt = f"""基于以下需求文档，设计页面布局：
-{json.dumps(state['requirement_doc'], ensure_ascii=False)}
-
-输出设计稿 JSON，包含：layout（grid 布局）、regions（每个区域的组件树和 props）"""
-        result = await self.llm.chat([
-            {"role": "system", "content": "你是页面设计专家，输出 JSON。"},
-            {"role": "user", "content": prompt}
-        ], temperature=0.3)
-        return {"design_spec": json.loads(result), "current_step": "design"}
-```
-
-```python
-# page_gen/agents/coder.py（Phase 3 增强版）
-class CoderAgent:
-    """代码生成：基于设计稿生成完整 HTML"""
-    def __init__(self, llm: LLMClient):
-        self.llm = llm
-
-    async def run(self, state: GenerationState) -> dict:
-        # 如果有修复历史，带上修复建议
-        fix_context = ""
-        if state.get("fix_history"):
-            last_fix = state["fix_history"][-1]
-            fix_context = f"\n\n上一轮验证失败原因：{last_fix['issues']}\n请修复这些问题。"
-
-        prompt = f"""基于以下设计稿生成完整 HTML 页面：
-{json.dumps(state['design_spec'], ensure_ascii=False)}
-
-要求：
-1. 内联 CSS 和 JS
-2. 使用 ECharts 做图表
-3. 响应式布局
-4. 现代化 UI
-5. 返回纯 HTML{fix_context}"""
-        result = await self.llm.chat([
-            {"role": "system", "content": "你是前端代码生成专家，只返回 HTML 代码。"},
-            {"role": "user", "content": prompt}
-        ], temperature=0.2)
-        html = result.strip()
-        if html.startswith("```html"):
-            html = html[7:]
-        if html.endswith("```"):
-            html = html[:-3]
-        return {"html_code": html.strip(), "current_step": "code"}
-```
-
-```python
-# page_gen/agents/verifier.py（Phase 3 基础版）
-class VerifierAgent:
-    """验证：检查 HTML 基础质量"""
-    def run(self, state: GenerationState) -> dict:
-        html = state.get("html_code", "")
-        issues = []
-
-        # 基础检查
-        if not html or len(html) < 100:
-            issues.append("HTML 内容过短")
-        if "<html" not in html.lower():
-            issues.append("缺少 <html> 标签")
-        if "<body" not in html.lower():
-            issues.append("缺少 <body> 标签")
-        if "<script" not in html.lower() and "<style" not in html.lower():
-            issues.append("缺少 script 或 style 标签")
-
-        passed = len(issues) == 0
-        return {
-            "verify_report": {"passed": passed, "issues": issues},
-            "current_step": "verify"
-        }
-```
-
-```python
-# page_gen/agents/fixer.py
-class FixerAgent:
-    """自动修复：根据验证报告生成修复方案"""
-    def __init__(self, llm: LLMClient):
-        self.llm = llm
-
-    async def run(self, state: GenerationState) -> dict:
-        issues = state.get("verify_report", {}).get("issues", [])
-        fix_entry = {"iteration": state["iteration"] + 1, "issues": issues}
-        return {
-            "fix_history": state.get("fix_history", []) + [fix_entry],
-            "iteration": state["iteration"] + 1,
-            "current_step": "fix"
-        }
-```
-
-### 3.5 改造 GenerationRunner
-
-```python
-# page_gen/services/generation_runner.py（Phase 3 版）
-from langgraph.checkpoint.memory import MemorySaver
 
 class GenerationRunner:
     def __init__(self, llm: LLMClient):
-        self.graph = build_generation_graph(llm)
-        self.checkpointer = MemorySaver()  # Phase 4 换成 MySQL
+        self.llm = llm
+        self.graph = build_graph(llm)
 
-    async def start(self, session_id: str):
-        session = await session_store.get(session_id)
-        initial_state = GenerationState(
-            session_id=session_id,
-            user_id=session.user_id,
-            prompt=session.prompt,
-            attachments=[],
-            requirement_doc=None,
-            design_spec=None,
-            html_code=None,
-            verify_report=None,
-            fix_history=[],
-            current_step="analyze",
-            iteration=0,
-            max_iterations=3,
-            status="running",
-            marker=None,
-            version=None,
-            preview_url=None,
-            total_tokens=0,
-            total_duration_ms=0,
+    async def start(self, session_id: str) -> None:
+        await session_store.update(session_id, status=SessionStatus.RUNNING)
+
+        try:
+            session = await session_store.get(session_id)
+            prompt = session.prompt if session else ""
+
+            # 步骤事件：analyze
+            await event_bus.publish(session_id, "analyze", {"message": "正在分析需求..."})
+            await self._write_step(session_id, "analyze", "开始需求分析")
+
+            # 步骤事件：design
+            await event_bus.publish(session_id, "design", {"message": "正在制定设计方案..."})
+            await self._write_step(session_id, "design", "开始设计")
+
+            # 步骤事件：code
+            await event_bus.publish(session_id, "code", {"message": "AI 正在生成页面代码..."})
+            await self._write_step(session_id, "code", "开始生成")
+
+            # 执行 LangGraph 图（内部串行执行 analyze → design → code → verify）
+            final_state = await self.graph.ainvoke({"prompt": prompt})
+
+            await self._write_step(session_id, "verify", final_state["verify_message"])
+            await event_bus.publish(
+                session_id, "verify", {"message": final_state["verify_message"]}
+            )
+
+            if not final_state["verified"]:
+                raise ValueError(final_state["verify_message"])
+
+            html = final_state["html"]
+
+        except Exception as e:
+            logger.exception("generation failed for session %s", session_id)
+            await event_bus.publish(session_id, "error", {"message": f"生成失败：{e}"})
+            await session_store.update(session_id, status=SessionStatus.FAILED)
+            await event_bus.publish_done(session_id)
+            return
+
+        marker = f"page_{session_id[:8]}"
+        version = 1
+        await self._save_page(marker, version, html, created_by=session_id)
+        await session_store.update(
+            session_id,
+            status=SessionStatus.COMPLETED,
+            marker=marker,
+            version=version,
+            preview_url=f"/api/v1/page/{marker}",
         )
+        await event_bus.publish(
+            session_id,
+            "host",
+            {"message": f"页面已生成，预览地址: /api/v1/page/{marker}", "url": f"/api/v1/page/{marker}"},
+        )
+        await event_bus.publish_done(session_id)
 
-        # SSE 事件回调
-        config = {"configurable": {"thread_id": session_id}}
+    async def _write_step(self, session_id: str, step: str, message: str) -> None:
+        record = GenSessionStep(
+            session_id=session_id,
+            step=step,
+            direction="output",
+            output_data={"message": message},
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
 
-        # 执行图
-        final_state = await self.graph.ainvoke(initial_state, config=config)
+    async def _save_page(self, marker: str, version: int, html: str, created_by: str) -> None:
+        record = PageVersion(
+            marker=marker,
+            version=version,
+            html_content=html,
+            status=PageStatus.PUBLISHED,
+            created_by=created_by,
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
 
-        # 托管
-        if final_state.get("html_code"):
-            marker = f"page_{session_id[:8]}"
-            version = 1
-            await page_store.save(marker, version, final_state["html_code"])
-            await session_store.update(session_id, status="completed",
-                                        marker=marker, version=version)
+
+_llm = LLMClient(
+    api_key=settings.llm_api_key,
+    model=settings.llm_model,
+    base_url=settings.llm_base_url,
+)
+generation_runner = GenerationRunner(_llm)
 ```
 
-### 3.6 验收标准
+**说明**：`graph.ainvoke()` 是 LangGraph 的异步执行入口，它会按图的边顺序依次执行所有节点，最终返回合并后的完整 state。Runner 不再需要持有 `CoderAgent` 引用，只持有 `graph`。
 
-- [ ] 输入"做一个销售数据看板"，Analyzer 输出结构化需求 JSON
-- [ ] Designer 输出布局设计稿
-- [ ] Coder 输出完整 HTML
-- [ ] Verifier 检查通过/失败
-- [ ] 失败时 Fixer 触发修复，最多 3 轮
-- [ ] 每一步的输入输出都记录到 `gen_session_step` 表
-- [ ] SSE 推送每一步进度
-- [ ] **端到端跑通：需求→分析→设计→生成→验证→修复→托管**
+---
+
+### Step 9：更新 agents `__init__.py` 导出
+
+修改 `sinan/agents/__init__.py`，把新增的 Agent 都导出：
+
+```python
+# sinan/agents/__init__.py
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
+from sinan.agents.analyzer import AnalyzerAgent
+from sinan.agents.designer import DesignerAgent
+from sinan.agents.coder import CoderAgent
+from sinan.agents.verifier import VerifierAgent
+from sinan.agents.graph import build_graph
+```
+
+---
+
+### Step 10：验收测试
+
+启动服务后，用 curl 测试完整流程：
+
+```bash
+# 1. 发起生成请求
+curl -X POST http://localhost:8000/api/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "做一个 GPU 使用率监控看板，展示 8 张卡的实时使用率折线图"}'
+
+# 返回 {"session_id": "xxx", "status": "running"}
+
+# 2. 订阅 SSE 流（把 xxx 换成上面返回的 session_id）
+curl -N http://localhost:8000/api/v1/generate/xxx/stream
+```
+
+预期 SSE 输出顺序：
+
+```
+event: analyze
+data: {"message": "正在分析需求..."}
+
+event: design
+data: {"message": "正在制定设计方案..."}
+
+event: code
+data: {"message": "AI 正在生成页面代码..."}
+
+event: verify
+data: {"message": "校验通过"}
+
+event: host
+data: {"message": "页面已生成，预览地址: /api/v1/page/page_xxx", "url": "/api/v1/page/page_xxx"}
+
+event: done
+data: {}
+```
+
+---
+
+### 文件变更汇总
+
+| 操作 | 文件 |
+|------|------|
+| 新建 | `sinan/agents/state.py` |
+| 新建 | `sinan/agents/analyzer.py` |
+| 新建 | `sinan/agents/designer.py` |
+| 新建 | `sinan/agents/verifier.py` |
+| 新建 | `sinan/agents/graph.py` |
+| 修改 | `sinan/agents/coder.py`（`generate` → `run`，入参加 design/requirements） |
+| 修改 | `sinan/services/generation_runner.py`（用 graph.ainvoke 替换 coder.generate） |
+| 修改 | `sinan/agents/__init__.py`（补充导出） |
+| 修改 | `requirements.txt`（加 `langgraph>=0.2.0`） |
+
+Phase 3 完成后，`verified=False` 的条件边留着，Phase 4 只需把 `graph.py` 里的条件边 lambda 改成路由到 `Fixer` 节点，整个流水线自然延伸。
 
 ---
 
