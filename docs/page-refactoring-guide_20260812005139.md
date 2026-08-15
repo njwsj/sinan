@@ -2363,6 +2363,33 @@ def build_graph(llm: LLMClient) -> StateGraph:
 
 **说明**：`gate_decision` 用 `.get("gate_decision", "proceed")` 而不是直接用 `[]`，是因为第一次调用时 state 里还没有这个 key，用 `.get` 默认 proceed 可以避免 KeyError。
 
+```mermaid
+flowchart TD
+    A([开始]) --> B[analyze\nAnalyzer Agent]
+    B --> C{gate_analyze\n门禁}
+    C -- proceed --> D[design\nDesigner Agent]
+    C -- retry --> B
+
+    D --> E{gate_design\n门禁}
+    E -- proceed --> F[code\nCoder Agent]
+    E -- retry --> D
+
+    F --> G{gate_code\n门禁}
+    G -- proceed --> H[verify\nVerifier Agent]
+    G -- fix --> I[fix\nFixer Agent]
+    G -- block --> Z([END])
+
+    H --> J{gate_verify\n门禁}
+    J -- proceed --> Z
+    J -- retry --> I
+    J -- block --> Z
+
+    I --> F
+
+```
+
+
+
 ---
 
 ### Step 7：更新 GenerationRunner，感知修复迭代

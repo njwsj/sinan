@@ -44,7 +44,7 @@ class GateEngine:
         except ValidationError as e:
             issues = [err["msg"] for err in e.errors()]
             return GateResult(decision="retry", reason="需求分析格式校验失败", issues=issues)
-
+        """业务内容校验，返回错误列表（空列表 = 通过）。"""
         errors = contract.validate_content()
         if errors:
             return GateResult(decision="retry", reason="需求分析内容校验失败", issues=errors)
