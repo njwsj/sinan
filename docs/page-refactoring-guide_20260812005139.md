@@ -1861,66 +1861,256 @@ Phase 3 完成后，`verified=False` 的条件边留着，Phase 4 只需把 `gra
 
 ## 七、Phase 4：Harness 工程化 — 质量护栏
 
-**目标**：为每个步骤添加契约校验、门禁节点、Checkpoint 持久化，实现 Harness 工程。
+**目标**：在 Phase 3 的 `Analyzer→Designer→Coder→Verifier` 流水线基础上，加入：
+1. **Fixer Agent**：验证失败时自动修复 HTML（最多 3 轮）
+2. **门禁节点（Gate）**：每步后校验输出质量，决定 proceed / retry / fix / block
+3. **契约模型（Contract）**：用 Pydantic 约束每步的输入/输出格式
+4. **Checkpoint**：每步完成后存快照，支持查看审计轨迹
+5. **审计 API**：`GET /api/v1/generate/{id}/audit` 返回完整执行记录
 
 **预计工时**：5-7 天
 
-### 4.1 核心概念
+**涉及文件变动**：
 
-Harness 工程的三个核心组件：
+```
+新建：
+  sinan/harness/__init__.py
+  sinan/harness/gates.py
+  sinan/harness/validators/__init__.py
+  sinan/harness/validators/browser_validator.py
+  sinan/agents/fixer.py
+  sinan/models/contracts.py
+  sinan/api/routes/audit.py
 
-1. **Contract Validator（契约校验器）**：每步输入/输出用 Pydantic Schema 校验
-2. **Gate Engine（门禁引擎）**：每步后判断 proceed/retry/block
-3. **Checkpoint Store（检查点存储）**：每步完成后保存快照，支持回滚
-
-### 4.2 契约模型（参考原项目 models/contracts.py + harness/contracts.py）
-
-```python
-# page_gen/models/contracts.py
-from pydantic import BaseModel, Field
-from typing import List, Optional
-
-class DataSourceConfig(BaseModel):
-    type: str  # "api" | "static" | "excel"
-    endpoint: Optional[str] = None
-    description: Optional[str] = None
-
-class NormalizedRequirement(BaseModel):
-    """Step 1 输出契约"""
-    appName: str = Field(..., min_length=1)
-    appDescription: str = Field(..., min_length=1)
-    pageType: str  # dashboard|form|list|detail|landing
-    targetUser: str = ""
-    dataSource: DataSourceConfig
-    pageStructure: dict  # 布局结构
-    styleSpec: dict      # 样式规格
-    acceptanceCriteria: List[str] = Field(..., min_length=1)
-
-class DesignSpec(BaseModel):
-    """Step 2 输出契约"""
-    layout: dict         # 布局
-    regions: List[dict]  # 区域列表
-    componentTree: dict  # 组件树
-
-class CodeOutput(BaseModel):
-    """Step 3 输出契约"""
-    html: str = Field(..., min_length=100)
-    hasScript: bool
-    hasStyle: bool
-
-class VerifyReport(BaseModel):
-    """Step 4 输出契约"""
-    passed: bool
-    issues: List[str] = []
-    score: float = Field(0.0, ge=0.0, le=1.0)
+修改：
+  sinan/agents/state.py          ← 添加 gate_decision/iteration/max_iterations
+  sinan/agents/graph.py          ← 加入门禁节点、Fixer 修复循环
+  sinan/agents/__init__.py       ← 补充导出 FixerAgent
+  sinan/services/generation_runner.py ← 传入 iteration 初始值，感知修复轮次
+  sinan/api/app.py               ← 注册 audit_router
+  requirements.txt               ← 添加 playwright
 ```
 
-### 4.3 状态机（参考原项目 harness/state_machine.py）
+### 4.1 核心概念
+
+Harness 工程的四个核心组件：
+
+1. **Contract Validator（契约校验器）**：每步输入/输出用 Pydantic Schema 校验
+2. **Gate Engine（门禁引擎）**：每步后判断 proceed / retry / fix / block
+3. **Fixer Agent**：LLM 驱动的 HTML 修复，与 Gate 配合形成最多 3 轮的修复循环
+4. **Checkpoint Store（检查点存储）**：每步完成后保存快照，支持审计和回滚
+
+### Step 1：安装新依赖
+
+**说明**：Phase 4 新增两个依赖：
+- `langgraph-checkpoint-mysql`：LangGraph 官方的 MySQL Checkpoint 实现，用于在每个节点执行后自动持久化 state，支持断点续跑和审计。
+- `playwright`：无头浏览器，用于渲染生成的 HTML 并检查 JS 报错、图表是否正确初始化。
+
+在 `requirements.txt` 末尾追加：
+
+```txt
+langgraph-checkpoint-mysql>=0.1.0
+playwright>=1.40.0
+```
+
+然后执行安装：
+
+```bash
+pip install langgraph-checkpoint-mysql playwright
+playwright install chromium
+```
+
+---
+
+### Step 2：新建契约模型文件
+
+**说明**：Pydantic 契约模型用来约束每个 Agent 的输出格式。例如 Analyzer 必须输出某些关键字段，Coder 输出的 HTML 至少要有 100 个字符。这样一旦 LLM 输出偏轨，Pydantic 校验就会报错，触发重试而不是把垃圾数据传给下一步。
+
+路径：`sinan/models/contracts.py`（新建文件）
 
 ```python
-# page_gen/harness/state_machine.py
+# sinan/models/contracts.py
+from pydantic import BaseModel, Field, ValidationError
+from typing import List
+
+
+class AnalyzeContract(BaseModel):
+    """Analyzer 输出契约：结构化需求描述必须包含这些核心字段。"""
+    requirements: str = Field(..., min_length=20,
+                              description="结构化需求清单，至少 20 个字符")
+
+    def validate_content(self) -> List[str]:
+        """业务内容校验，返回错误列表（空列表 = 通过）。"""
+        errors = []
+        # Pydantic 的 min_length 已保证长度，这里可追加更多业务规则
+        # 例如：要求包含"功能"或"数据"等关键词（按需开启）
+        return errors
+
+
+class DesignContract(BaseModel):
+    """Designer 输出契约：设计方案必须包含布局和配色描述。"""
+    design: str = Field(..., min_length=20,
+                        description="页面设计方案，至少 20 个字符")
+
+    def validate_content(self) -> List[str]:
+        """业务内容校验，返回错误列表（空列表 = 通过）。"""
+        errors = []
+        # 例如：要求包含布局或配色关键词（按需开启）
+        return errors
+
+
+class CodeContract(BaseModel):
+    """Coder 输出契约：生成的 HTML 必须满足最低结构要求。"""
+    html: str = Field(..., min_length=100, description="生成的 HTML，至少 100 字符")
+
+    def validate_content(self) -> List[str]:
+        """HTML 结构校验，返回错误列表（空列表 = 通过）。"""
+        errors = []
+        html_lower = self.html.lower()
+        if "<!doctype" not in html_lower[:200]:
+            errors.append("缺少 <!DOCTYPE html>")
+        if "<html" not in html_lower:
+            errors.append("缺少 <html> 标签")
+        if "<body" not in html_lower:
+            errors.append("缺少 <body> 标签")
+        return errors
+
+
+class VerifyContract(BaseModel):
+    """Verifier 输出契约：校验结果必须明确给出通过/失败。"""
+    verified: bool
+    verify_message: str = Field(..., min_length=1)
+
+    def validate_content(self) -> List[str]:
+        return []
+```
+
+**设计说明**：每个契约类统一提供 `validate_content()` 方法，封装该步骤的业务校验规则，返回错误列表。门禁引擎（gates.py）调用这个方法，只负责根据结果做路由决策，不自己实现校验逻辑。两层职责完全分离：contract 负责"什么是合法输出"，gate 负责"不合法时怎么办"。
+
+---
+
+### Step 3：新建门禁引擎
+
+**说明**：门禁节点在每个 Agent 执行完之后运行，根据 contract 的校验结果做路由决策。门禁有四种决策：
+- `proceed`：通过，继续下一步
+- `retry`：输出有问题，重新执行当前 Agent
+- `fix`：代码层面有问题，进入 Fixer 修复
+- `block`：超过最大修复次数，终止整个流程
+
+**职责分工**：
+- `contracts.py`（Step 2）负责"什么是合法输出"——用 Pydantic 做类型/格式校验，`validate_content()` 封装业务校验规则
+- `gates.py`（本步）负责"不合法时怎么办"——调用 contract 拿到校验结果，只做路由决策
+
+这样两层职责完全分离：扩展校验规则时只改 `contracts.py`，改路由策略时只改 `gates.py`。
+
+首先创建 `sinan/harness/__init__.py`（空文件）：
+
+```python
+# sinan/harness/__init__.py
+```
+
+然后创建 `sinan/harness/gates.py`：
+
+```python
+# sinan/harness/gates.py
+import logging
+from dataclasses import dataclass, field
+from typing import List
+from pydantic import ValidationError
+
+from sinan.models.contracts import AnalyzeContract, DesignContract, CodeContract
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GateResult:
+    decision: str           # "proceed" | "retry" | "fix" | "block"
+    reason: str = ""
+    issues: List[str] = field(default_factory=list)
+
+
+class GateEngine:
+    """
+    门禁引擎：在每个 Agent 步骤后评估输出质量，决定是继续/重试/修复/阻断。
+    校验逻辑委托给各步骤的 Contract，门禁只做路由决策。
+    """
+
+    def evaluate(self, step: str, state: dict) -> GateResult:
+        """根据步骤名调用对应的门禁方法。"""
+        method = getattr(self, f"_gate_{step}", None)
+        if method is None:
+            logger.debug("no gate defined for step %s, proceeding", step)
+            return GateResult(decision="proceed")
+        return method(state)
+
+    def _gate_analyze(self, state: dict) -> GateResult:
+        try:
+            contract = AnalyzeContract(requirements=state.get("requirements", ""))
+        except ValidationError as e:
+            issues = [err["msg"] for err in e.errors()]
+            return GateResult(decision="retry", reason="需求分析格式校验失败", issues=issues)
+
+        errors = contract.validate_content()
+        if errors:
+            return GateResult(decision="retry", reason="需求分析内容校验失败", issues=errors)
+        return GateResult(decision="proceed")
+
+    def _gate_design(self, state: dict) -> GateResult:
+        try:
+            contract = DesignContract(design=state.get("design", ""))
+        except ValidationError as e:
+            issues = [err["msg"] for err in e.errors()]
+            return GateResult(decision="retry", reason="设计方案格式校验失败", issues=issues)
+
+        errors = contract.validate_content()
+        if errors:
+            return GateResult(decision="retry", reason="设计方案内容校验失败", issues=errors)
+        return GateResult(decision="proceed")
+
+    def _gate_code(self, state: dict) -> GateResult:
+        try:
+            contract = CodeContract(html=state.get("html", ""))
+        except ValidationError as e:
+            issues = [err["msg"] for err in e.errors()]
+            # ValidationError 说明连基本格式都不对，直接走 fix
+            iteration = state.get("iteration", 0)
+            if iteration >= state.get("max_iterations", 3):
+                return GateResult(decision="block", reason="超过最大修复次数", issues=issues)
+            return GateResult(decision="fix", reason="HTML 格式校验失败", issues=issues)
+
+        errors = contract.validate_content()
+        if errors:
+            iteration = state.get("iteration", 0)
+            if iteration >= state.get("max_iterations", 3):
+                return GateResult(decision="block", reason="超过最大修复次数", issues=errors)
+            return GateResult(decision="fix", reason="HTML 结构不合格", issues=errors)
+        return GateResult(decision="proceed")
+
+    def _gate_verify(self, state: dict) -> GateResult:
+        if state.get("verified"):
+            return GateResult(decision="proceed")
+        iteration = state.get("iteration", 0)
+        max_iter = state.get("max_iterations", 3)
+        if iteration >= max_iter:
+            return GateResult(
+                decision="block",
+                reason=f"验证失败且已达最大迭代次数 {max_iter}",
+                issues=[state.get("verify_message", "未知错误")],
+            )
+        return GateResult(
+            decision="retry",
+            reason="验证未通过，进入修复循环",
+            issues=[state.get("verify_message", "")],
+        )
+```
+
+**`sinan/harness/state_machine.py`**（供调试和文档用，定义合法流转路径）：
+
+```python
+# sinan/harness/state_machine.py
 from enum import Enum
-from typing import Optional
+
 
 class PipelineState(Enum):
     INIT = "init"
@@ -1933,145 +2123,199 @@ class PipelineState(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-TRANSITION_TABLE = {
-    PipelineState.INIT: [PipelineState.ANALYSIS],
-    PipelineState.ANALYSIS: [PipelineState.DESIGN, PipelineState.FAILED],
-    PipelineState.DESIGN: [PipelineState.GENERATION, PipelineState.ANALYSIS],  # 可回退
+
+TRANSITION_TABLE: dict[PipelineState, list[PipelineState]] = {
+    PipelineState.INIT:       [PipelineState.ANALYSIS],
+    PipelineState.ANALYSIS:   [PipelineState.DESIGN, PipelineState.FAILED],
+    PipelineState.DESIGN:     [PipelineState.GENERATION, PipelineState.ANALYSIS],
     PipelineState.GENERATION: [PipelineState.VALIDATION],
     PipelineState.VALIDATION: [PipelineState.HOST, PipelineState.FIX, PipelineState.FAILED],
-    PipelineState.FIX: [PipelineState.GENERATION],
-    PipelineState.HOST: [PipelineState.COMPLETED, PipelineState.FAILED],
-    PipelineState.COMPLETED: [],
-    PipelineState.FAILED: [],
+    PipelineState.FIX:        [PipelineState.GENERATION],
+    PipelineState.HOST:       [PipelineState.COMPLETED, PipelineState.FAILED],
+    PipelineState.COMPLETED:  [],
+    PipelineState.FAILED:     [],
 }
+
 
 def can_transition(from_state: PipelineState, to_state: PipelineState) -> bool:
     return to_state in TRANSITION_TABLE.get(from_state, [])
 ```
 
-### 4.4 门禁节点（参考原项目 harness/gates.py）
+---
+
+### Step 4：新建 Fixer Agent
+
+**说明**：Fixer 是 Phase 4 的核心新增节点。当 Verifier 发现 HTML 有问题时，Fixer 会拿着原始 HTML 和错误信息请 LLM 修复。每次执行都递增 `iteration`，`_gate_verify` 通过读 `iteration` 决定继续修复还是 block。温度用 0.2 让修复更保守，减少引入新问题的风险。
+
+新建 `sinan/agents/fixer.py`：
 
 ```python
-# page_gen/harness/gates.py
-from typing import Protocol
+# sinan/agents/fixer.py
+import logging
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
 
-class GateResult:
-    def __init__(self, decision: str, reason: str = "", issues: list = None):
-        self.decision = decision  # "proceed" | "retry" | "block"
-        self.reason = reason
-        self.issues = issues or []
+logger = logging.getLogger(__name__)
 
-class GateEngine:
-    """门禁引擎：每步后判断是否继续"""
-    
-    def evaluate(self, step: str, output: dict, state: dict) -> GateResult:
-        method = getattr(self, f"_gate_{step}", None)
-        if method:
-            return method(output, state)
-        return GateResult(decision="proceed")
+SYSTEM_PROMPT = """你是一个前端代码修复专家。
+你会收到一段有问题的 HTML 页面代码，以及具体的错误描述。
+请修复这些问题，返回完整的、可直接在浏览器运行的 HTML 页面。
 
-    def _gate_analyze(self, output: dict, state: dict) -> GateResult:
-        req = output.get("requirement_doc", {})
-        if not req.get("appName"):
-            return GateResult("retry", "appName 为空", ["appName missing"])
-        if not req.get("pageStructure", {}).get("regions"):
-            return GateResult("retry", "regions 为空", ["regions missing"])
-        return GateResult("proceed")
+要求：
+1. 只修复错误描述中提到的问题，不要大改其他内容
+2. 返回完整的 HTML 文档（包含 <!DOCTYPE html>、<head>、<body>）
+3. 只返回纯 HTML 代码，不要任何 markdown 格式（不要 ```html 包裹）
+4. 不要任何解释文字，直接输出修复后的 HTML"""
 
-    def _gate_design(self, output: dict, state: dict) -> GateResult:
-        spec = output.get("design_spec", {})
-        if not spec.get("layout"):
-            return GateResult("retry", "layout 为空", ["layout missing"])
-        if not spec.get("regions"):
-            return GateResult("retry", "regions 为空", ["regions missing"])
-        return GateResult("proceed")
 
-    def _gate_code(self, output: dict, state: dict) -> GateResult:
-        html = output.get("html_code", "")
-        if not html or len(html) < 100:
-            return GateResult("fix", "HTML 内容过短", ["html too short"])
-        if "<html" not in html.lower():
-            return GateResult("fix", "缺少 html 标签", ["missing html tag"])
-        return GateResult("proceed")
+class FixerAgent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
 
-    def _gate_verify(self, output: dict, state: dict) -> GateResult:
-        report = output.get("verify_report", {})
-        if report.get("passed"):
-            return GateResult("proceed")
-        if state.get("iteration", 0) < state.get("max_iterations", 3):
-            return GateResult("retry", "验证未通过", report.get("issues", []))
-        return GateResult("block", "超过最大修复次数")
-```
+    async def run(self, state: PageGenState) -> dict:
+        iteration = state.get("iteration", 0) + 1
+        logger.info("fixer running, iteration=%d", iteration)
 
-### 4.5 Checkpoint 持久化（参考原项目 harness/checkpoint.py）
-
-```python
-# page_gen/harness/checkpoint.py
-import json
-from datetime import datetime
-
-class CheckpointStore:
-    """每步完成后保存状态快照到 MySQL"""
-    
-    async def save(self, session_id: str, step: str, version: int, state: dict):
-        # 存入 gen_session_step 表
-        await db.execute(
-            "INSERT INTO gen_session_step (session_id, step, direction, output_data, created_at) "
-            "VALUES (:sid, :step, 'checkpoint', :data, :ts)",
-            values={
-                "sid": session_id, "step": step,
-                "data": json.dumps(state, ensure_ascii=False),
-                "ts": datetime.now()
-            }
+        user_content = (
+            f"错误描述：\n{state.get('verify_message', '未知错误')}\n\n"
+            f"需要修复的 HTML：\n{state.get('html', '')}"
         )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        fixed_html = await self.llm.chat(messages, temperature=0.2)
+        fixed_html = self._strip_markdown(fixed_html)
 
-    async def load(self, session_id: str, step: str, version: int = None) -> dict:
-        # 从 gen_session_step 表加载
-        sql = "SELECT output_data FROM gen_session_step WHERE session_id=:sid AND step=:step"
-        if version:
-            sql += " AND version=:ver"
-        sql += " ORDER BY created_at DESC LIMIT 1"
-        row = await db.fetch_one(sql, values={"sid": session_id, "step": step})
-        return json.loads(row["output_data"]) if row else None
+        return {
+            "html": fixed_html,
+            "iteration": iteration,
+            # 重置验证状态，让 verify 节点重新校验修复后的 HTML
+            "verified": False,
+            "verify_message": "",
+        }
 
-    async def rollback(self, session_id: str, step: str, version: int):
-        """回滚到指定步骤的指定版本"""
-        state = await self.load(session_id, step, version)
-        if state:
-            return state
-        raise ValueError(f"Checkpoint not found: {step}@v{version}")
+    def _strip_markdown(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```html"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
 ```
 
-### 4.6 改造 LangGraph 图（加入门禁）
+---
+
+### Step 5：更新 PageGenState，加入 Harness 控制字段
+
+**说明**：Phase 4 新增三个字段：
+- `iteration`：当前修复轮次（从 0 开始）
+- `max_iterations`：最大允许修复轮次（默认 3）
+- `gate_decision`：当前门禁节点的决策结果（`proceed` / `retry` / `fix` / `block`）
+
+修改 `sinan/agents/state.py`：
 
 ```python
-# page_gen/agents/graph.py（Phase 4 版）
-def build_generation_graph(llm: LLMClient):
+# sinan/agents/state.py
+from typing import TypedDict
+
+
+class PageGenState(TypedDict):
+    """LangGraph 节点之间共享的流水线状态。"""
+
+    # 输入
+    prompt: str
+
+    # Analyzer 产出
+    requirements: str       # 结构化需求：功能列表、交互要点
+
+    # Designer 产出
+    design: str             # 设计方案：布局结构、配色方案、组件清单
+
+    # Coder 产出
+    html: str               # 生成的 HTML 页面
+
+    # Verifier 产出
+    verified: bool          # 是否通过验证
+    verify_message: str     # 验证结论或错误描述
+
+    # Phase 4 新增：Harness 控制字段
+    iteration: int          # 当前修复迭代次数（从 0 开始）
+    max_iterations: int     # 最大允许修复次数（默认 3）
+    gate_decision: str      # 当前门禁决策（proceed/retry/fix/block）
+```
+
+---
+
+### Step 6：改造 graph.py，接入 Fixer + 门禁
+
+**说明**：这是 Phase 4 最核心的改动。在每个 Agent 节点之后插入对应的 `gate_xxx` 节点，由门禁决策路由后续走向：
+
+```
+analyze → gate_analyze → (proceed: design | retry: analyze)
+design  → gate_design  → (proceed: code   | retry: design)
+code    → gate_code    → (proceed: verify | fix: fix | block: END)
+verify  → gate_verify  → (proceed: END    | retry: fix | block: END)
+fix     → code（重新生成，进入修复循环）
+```
+
+同时，把 Phase 3 里那个占位 lambda `"end" if state["verified"] else "end"` 真正改掉，接入真实路由。用 `MemorySaver` 作为开发阶段的 Checkpoint（不需要额外配置），生产环境换 `AsyncMySqlSaver` 时只改一行。
+
+修改 `sinan/agents/graph.py`（完整替换）：
+
+```python
+# sinan/agents/graph.py
+import logging
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+from sinan.agents.state import PageGenState
+from sinan.agents.analyzer import AnalyzerAgent
+from sinan.agents.designer import DesignerAgent
+from sinan.agents.coder import CoderAgent
+from sinan.agents.verifier import VerifierAgent
+from sinan.agents.fixer import FixerAgent
+from sinan.agents.llm import LLMClient
+from sinan.harness.gates import GateEngine
+
+logger = logging.getLogger(__name__)
+
+
+def build_graph(llm: LLMClient) -> StateGraph:
     analyzer = AnalyzerAgent(llm)
     designer = DesignerAgent(llm)
     coder = CoderAgent(llm)
     verifier = VerifierAgent()
     fixer = FixerAgent(llm)
     gate_engine = GateEngine()
-    checkpoint = CheckpointStore()
 
-    async def gate_analyze(state):
-        result = gate_engine.evaluate("analyze", state, state)
+    # 门禁节点（不调用 LLM，只做决策）
+    async def gate_analyze(state: PageGenState) -> dict:
+        result = gate_engine.evaluate("analyze", state)
+        logger.info("gate_analyze: decision=%s", result.decision)
         return {"gate_decision": result.decision}
 
-    async def gate_design(state):
-        result = gate_engine.evaluate("design", state, state)
+    async def gate_design(state: PageGenState) -> dict:
+        result = gate_engine.evaluate("design", state)
+        logger.info("gate_design: decision=%s", result.decision)
         return {"gate_decision": result.decision}
 
-    async def gate_code(state):
-        result = gate_engine.evaluate("code", state, state)
+    async def gate_code(state: PageGenState) -> dict:
+        result = gate_engine.evaluate("code", state)
+        logger.info("gate_code: decision=%s, issues=%s", result.decision, result.issues)
         return {"gate_decision": result.decision}
 
-    async def gate_verify(state):
-        result = gate_engine.evaluate("verify", state, state)
+    async def gate_verify(state: PageGenState) -> dict:
+        result = gate_engine.evaluate("verify", state)
+        logger.info("gate_verify: decision=%s", result.decision)
         return {"gate_decision": result.decision}
 
-    graph = StateGraph(GenerationState)
+    # 构建图
+    graph = StateGraph(PageGenState)
+
+    # 注册节点
     graph.add_node("analyze", analyzer.run)
     graph.add_node("gate_analyze", gate_analyze)
     graph.add_node("design", designer.run)
@@ -2081,114 +2325,486 @@ def build_generation_graph(llm: LLMClient):
     graph.add_node("verify", verifier.run)
     graph.add_node("gate_verify", gate_verify)
     graph.add_node("fix", fixer.run)
-    graph.add_node("host", host_page)
 
+    # 连边：业务节点 → 门禁节点
     graph.set_entry_point("analyze")
     graph.add_edge("analyze", "gate_analyze")
-    graph.add_conditional_edges("gate_analyze", lambda s: s.get("gate_decision", "proceed"), {
-        "proceed": "design",
-        "retry": "analyze",
-    })
+    graph.add_conditional_edges(
+        "gate_analyze",
+        lambda s: s.get("gate_decision", "proceed"),
+        {"proceed": "design", "retry": "analyze"},
+    )
     graph.add_edge("design", "gate_design")
-    graph.add_conditional_edges("gate_design", lambda s: s.get("gate_decision", "proceed"), {
-        "proceed": "code",
-        "retry": "design",
-    })
+    graph.add_conditional_edges(
+        "gate_design",
+        lambda s: s.get("gate_decision", "proceed"),
+        {"proceed": "code", "retry": "design"},
+    )
     graph.add_edge("code", "gate_code")
-    graph.add_conditional_edges("gate_code", lambda s: s.get("gate_decision", "proceed"), {
-        "proceed": "verify",
-        "fix": "fix",
-    })
+    graph.add_conditional_edges(
+        "gate_code",
+        lambda s: s.get("gate_decision", "proceed"),
+        {"proceed": "verify", "fix": "fix", "block": END},
+    )
     graph.add_edge("verify", "gate_verify")
-    graph.add_conditional_edges("gate_verify", lambda s: s.get("gate_decision", "proceed"), {
-        "proceed": "host",
-        "retry": "fix",
-        "block": END,
-    })
-    graph.add_edge("fix", "code")
-    graph.add_edge("host", END)
+    graph.add_conditional_edges(
+        "gate_verify",
+        lambda s: s.get("gate_decision", "proceed"),
+        {"proceed": END, "retry": "fix", "block": END},
+    )
 
-    # MySQL Checkpoint（Phase 4 用 langgraph-checkpoint-mysql）
-    from langgraph.checkpoint.mysql import AsyncMySqlSaver
-    checkpointer = AsyncMySqlSaver.from_conn_string(db_url)
+    # fix 之后重新走 code（修复后重新验证）
+    graph.add_edge("fix", "code")
+
+    # Checkpoint：开发阶段用内存版，生产换 AsyncMySqlSaver 时只改这一行
+    checkpointer = MemorySaver()
     return graph.compile(checkpointer=checkpointer)
 ```
 
-### 4.7 验证器增强（参考原项目 harness/validators/）
+**说明**：`gate_decision` 用 `.get("gate_decision", "proceed")` 而不是直接用 `[]`，是因为第一次调用时 state 里还没有这个 key，用 `.get` 默认 proceed 可以避免 KeyError。
 
-Phase 4 可以用 Playwright 做真实浏览器验证：
+```mermaid
+flowchart TD
+    A([开始]) --> B[analyze\nAnalyzer Agent]
+    B --> C{gate_analyze\n门禁}
+    C -- proceed --> D[design\nDesigner Agent]
+    C -- retry --> B
+
+    D --> E{gate_design\n门禁}
+    E -- proceed --> F[code\nCoder Agent]
+    E -- retry --> D
+
+    F --> G{gate_code\n门禁}
+    G -- proceed --> H[verify\nVerifier Agent]
+    G -- fix --> I[fix\nFixer Agent]
+    G -- block --> Z([END])
+
+    H --> J{gate_verify\n门禁}
+    J -- proceed --> Z
+    J -- retry --> I
+    J -- block --> Z
+
+    I --> F
+
+```
+
+
+
+---
+
+### Step 7：更新 GenerationRunner，感知修复迭代
+
+**说明**：Runner 需要在初始 state 里传入 `iteration=0` 和 `max_iterations=3`，让 Fixer 和 Gate 能读到这两个控制参数。同时加入 `config={"configurable": {"thread_id": session_id}}` 参数——LangGraph checkpointer 要求每次 invoke 时指定 thread_id，以便按 session 隔离状态，不同 session 的 checkpoint 不会互相影响。如果经历了修复轮次，也要推送 fix 事件让前端感知到。
+
+修改 `sinan/services/generation_runner.py`（完整替换）：
 
 ```python
-# page_gen/harness/validators/browser_validator.py
-from playwright.async_api import async_playwright
+# sinan/services/generation_runner.py
+import logging
+
+from sinan.agents.llm import LLMClient
+from sinan.agents.graph import build_graph
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import GenSessionStep, PageVersion
+from sinan.models.enums import SessionStatus, PageStatus
+from sinan.services.session_store import session_store
+from sinan.services.generation_event_bus import event_bus
+from sinan.config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+class GenerationRunner:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+        self.graph = build_graph(llm)
+
+    async def start(self, session_id: str) -> None:
+        """后台异步执行生成流程，不阻塞请求。"""
+        await session_store.update(session_id, status=SessionStatus.RUNNING)
+
+        try:
+            session = await session_store.get(session_id)
+            prompt = session.prompt if session else ""
+
+            # 推送各步骤开始事件（在 graph.ainvoke 之前，让前端看到进度）
+            await event_bus.publish(session_id, "analyze", {"message": "正在分析需求..."})
+            await self._write_step(session_id, "analyze", "开始需求分析")
+
+            await event_bus.publish(session_id, "design", {"message": "正在制定设计方案..."})
+            await self._write_step(session_id, "design", "开始设计")
+
+            await event_bus.publish(session_id, "code", {"message": "AI 正在生成页面代码..."})
+            await self._write_step(session_id, "code", "开始生成")
+
+            # 执行 LangGraph 图
+            # Phase 4 新增：传入 iteration 和 max_iterations 初始值
+            # config thread_id 让 checkpointer 按 session 隔离状态
+            final_state = await self.graph.ainvoke(
+                {
+                    "prompt": prompt,
+                    "iteration": 0,
+                    "max_iterations": 3,
+                },
+                config={"configurable": {"thread_id": session_id}},
+            )
+
+            # 如果经历了修复，推送修复事件
+            if final_state.get("iteration", 0) > 0:
+                await event_bus.publish(
+                    session_id,
+                    "fix",
+                    {"message": f"经过 {final_state['iteration']} 轮修复"},
+                )
+                await self._write_step(
+                    session_id, "fix",
+                    f"修复完成，共 {final_state['iteration']} 轮",
+                )
+
+            # 推送验证结果
+            await self._write_step(session_id, "verify", final_state.get("verify_message", ""))
+            await event_bus.publish(
+                session_id, "verify",
+                {"message": final_state.get("verify_message", "校验完成")},
+            )
+
+            if not final_state.get("verified"):
+                raise ValueError(
+                    f"验证失败（已修复 {final_state.get('iteration', 0)} 轮）："
+                    f"{final_state.get('verify_message', '未知错误')}"
+                )
+
+            html = final_state["html"]
+
+        except Exception as e:
+            logger.exception("generation failed for session %s", session_id)
+            await event_bus.publish(session_id, "error", {"message": f"生成失败：{e}"})
+            await session_store.update(session_id, status=SessionStatus.FAILED)
+            await event_bus.publish_done(session_id)
+            return
+
+        # 存页面、更新 session
+        marker = f"page_{session_id[:8]}"
+        version = 1
+        await self._save_page(marker, version, html, created_by=session_id)
+        await session_store.update(
+            session_id,
+            status=SessionStatus.COMPLETED,
+            marker=marker,
+            version=version,
+            preview_url=f"/api/v1/page/{marker}",
+        )
+        await event_bus.publish(
+            session_id,
+            "host",
+            {
+                "message": f"页面已生成，预览地址: /api/v1/page/{marker}",
+                "url": f"/api/v1/page/{marker}",
+            },
+        )
+        await event_bus.publish_done(session_id)
+
+    async def _write_step(self, session_id: str, step: str, message: str) -> None:
+        record = GenSessionStep(
+            session_id=session_id,
+            step=step,
+            direction="output",
+            output_data={"message": message},
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+    async def _save_page(self, marker: str, version: int, html: str, created_by: str) -> None:
+        record = PageVersion(
+            marker=marker,
+            version=version,
+            html_content=html,
+            status=PageStatus.PUBLISHED,
+            created_by=created_by,
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(record)
+            await db.commit()
+
+
+_llm = LLMClient(
+    api_key=settings.llm_api_key,
+    model=settings.llm_model,
+    base_url=settings.llm_base_url,
+)
+generation_runner = GenerationRunner(_llm)
+```
+
+---
+
+### Step 8：新建浏览器验证器（可选）
+
+**说明**：`BrowserValidator` 在无头 Chromium 里加载 HTML，检查 JS 错误和图表渲染状态。`playwright` 未安装时直接跳过（返回 passed=True），不会阻塞主流程。`wait_for_timeout(2000)` 给 ECharts 等 JS 渲染留出时间。
+
+先创建 `sinan/harness/validators/__init__.py`（空文件），再创建 `sinan/harness/validators/browser_validator.py`：
+
+```python
+# sinan/harness/validators/browser_validator.py
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class BrowserValidator:
-    """用 Playwright 做真实浏览器验证"""
-    
+    """
+    用 Playwright 在无头 Chromium 里加载 HTML，检查 JS 错误和渲染状态。
+    需要先安装：pip install playwright && playwright install chromium
+    playwright 未安装时自动降级为跳过（返回 passed=True）。
+    """
+
     async def validate(self, html: str) -> dict:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("playwright 未安装，跳过浏览器验证")
+            return {"passed": True, "issues": [], "chart_count": 0}
+
         issues = []
+        chart_count = 0
+
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             page = await browser.new_page()
+            # 收集 JS 错误
+            js_errors = []
+            page.on("pageerror", lambda err: js_errors.append(str(err)))
             try:
-                await page.set_content(html)
-                # 检查 JS 错误
-                errors = await page.evaluate("() => window.__jsErrors || []")
-                if errors:
-                    issues.extend([f"JS Error: {e}" for e in errors])
+                await page.set_content(html, timeout=15000)
+                await page.wait_for_timeout(2000)  # 等待 JS 执行
+
                 # 检查 ECharts 渲染
                 charts = await page.query_selector_all("[_echarts_instance_]")
-                if not charts and "echarts" in html.lower():
-                    issues.append("ECharts 未正确初始化")
-                # 检查空白区域
+                chart_count = len(charts)
+                if chart_count == 0 and "echarts" in html.lower():
+                    issues.append("ECharts 未正确初始化（引用了 ECharts 但未找到渲染实例）")
+
+                # 检查页面内容不为空
                 body_text = await page.inner_text("body")
                 if len(body_text.strip()) < 10:
-                    issues.append("页面内容为空")
+                    issues.append("页面 body 内容为空")
+
+                # 附上 JS 错误
+                issues.extend([f"JS Error: {e}" for e in js_errors])
+
             finally:
                 await browser.close()
 
         return {
             "passed": len(issues) == 0,
             "issues": issues,
-            "chart_count": len(charts) if 'charts' in dir() else 0,
+            "chart_count": chart_count,
         }
 ```
 
-### 4.8 审计 API
+---
+
+### Step 9：新建审计 API
+
+**说明**：审计 API 返回某次生成的完整执行轨迹——每个步骤执行了什么、时间戳、门禁决策。对调试 LLM 输出质量和排查修复失败原因非常有用。
+
+新建 `sinan/api/routes/audit.py`：
 
 ```python
-# page_gen/api/routes/audit.py
-@router.get("/{session_id}/audit")
+# sinan/api/routes/audit.py
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sinan.models.database import AsyncSessionLocal
+from sinan.models.tables import GenSessionStep, GenSession
+
+router = APIRouter()
+
+
+@router.get("/generate/{session_id}/audit")
 async def get_audit(session_id: str):
-    """获取会话审计轨迹"""
-    steps = await db.fetch_all(
-        "SELECT * FROM gen_session_step WHERE session_id=:sid ORDER BY created_at",
-        values={"sid": session_id}
-    )
+    """
+    返回指定会话的完整执行审计轨迹。
+    包含每个步骤的输入/输出、门禁决策、时间戳。
+    """
+    async with AsyncSessionLocal() as db:
+        # 先确认 session 存在
+        session_result = await db.execute(
+            select(GenSession).where(GenSession.id == session_id)
+        )
+        session = session_result.scalar_one_or_none()
+        if session is None:
+            return JSONResponse(status_code=404, content={"detail": f"会话 {session_id} 不存在"})
+
+        # 查询所有步骤记录
+        steps_result = await db.execute(
+            select(GenSessionStep)
+            .where(GenSessionStep.session_id == session_id)
+            .order_by(GenSessionStep.created_at)
+        )
+        steps = steps_result.scalars().all()
+
+    audit_trail = [
+        {
+            "step": s.step,
+            "direction": s.direction,
+            "output": s.output_data,
+            "gate_decision": s.gate_decision,
+            "timestamp": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in steps
+    ]
+
     return {
-        "sessionId": session_id,
-        "totalSteps": len(steps),
-        "auditTrail": [
-            {
-                "step": s["step"],
-                "direction": s["direction"],
-                "gateDecision": s["gate_decision"],
-                "timestamp": s["created_at"].isoformat(),
-            }
-            for s in steps
-        ]
+        "session_id": session_id,
+        "status": session.status.value if session.status else None,
+        "prompt": session.prompt,
+        "total_steps": len(steps),
+        "audit_trail": audit_trail,
     }
 ```
 
-### 4.9 验收标准
+然后修改 `sinan/api/app.py`，注册 audit_router（只改 import 和 include_router）：
 
-- [ ] 每个 Agent 步骤后有契约校验
-- [ ] 契约校验失败时自动 retry
-- [ ] 验证失败时自动进入 fix 循环，最多 3 轮
-- [ ] 每步状态保存到 MySQL Checkpoint
-- [ ] `GET /api/v1/generate/{id}/audit` 返回审计轨迹
-- [ ] Playwright 验证器检查 JS 错误和 ECharts 渲染
-- [ ] **端到端跑通：带质量护栏的完整生成流程**
+```python
+# sinan/api/app.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from sinan.config.settings import settings
+from sinan.core.logging import setup_logging
+from sinan.models.database import init_db
+from sinan.api.routes.health import router as health_router
+from sinan.api.routes.generate import router as generate_router
+from sinan.api.routes.preview import router as preview_router
+from sinan.api.routes.audit import router as audit_router   # ← 新增
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging(settings.debug)
+    await init_db()
+    yield
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.include_router(health_router)
+    app.include_router(generate_router, prefix="/api/v1")
+    app.include_router(preview_router, prefix="/api/v1")
+    app.include_router(audit_router, prefix="/api/v1")       # ← 新增
+    return app
+
+
+app = create_app()
+```
+
+---
+
+### Step 10：更新 agents `__init__.py`
+
+修改 `sinan/agents/__init__.py`，补充 FixerAgent 的导出：
+
+```python
+# sinan/agents/__init__.py
+from sinan.agents.llm import LLMClient
+from sinan.agents.state import PageGenState
+from sinan.agents.analyzer import AnalyzerAgent
+from sinan.agents.designer import DesignerAgent
+from sinan.agents.coder import CoderAgent
+from sinan.agents.verifier import VerifierAgent
+from sinan.agents.fixer import FixerAgent       # ← 新增
+from sinan.agents.graph import build_graph
+```
+
+---
+
+### Step 11：验收测试
+
+**11.1 启动服务**
+
+```bash
+python -m sinan
+```
+
+**11.2 触发正常流程（验证全链路通过）**
+
+```bash
+# 发起生成
+curl -X POST http://localhost:8000/api/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "做一个 GPU 使用率监控看板，展示 8 张卡的实时使用率折线图"}'
+
+# 拿到 session_id，订阅 SSE（把 xxx 换掉）
+curl -N http://localhost:8000/api/v1/generate/xxx/stream
+```
+
+正常情况下 SSE 顺序：
+
+```
+event: analyze    正在分析需求...
+event: design     正在制定设计方案...
+event: code       AI 正在生成页面代码...
+event: verify     校验通过
+event: host       页面已生成，预览地址: /api/v1/page/page_xxx
+event: done
+```
+
+如果触发了修复：
+
+```
+event: analyze
+event: design
+event: code
+event: fix        经过 1 轮修复
+event: verify     校验通过
+event: host
+event: done
+```
+
+**11.3 查看审计轨迹**
+
+```bash
+curl http://localhost:8000/api/v1/generate/xxx/audit
+```
+
+预期返回：
+
+```json
+{
+  "session_id": "xxx",
+  "status": "completed",
+  "prompt": "做一个 GPU 使用率监控看板...",
+  "total_steps": 5,
+  "audit_trail": [
+    {"step": "analyze", "direction": "output", "output": {"message": "开始需求分析"}, "gate_decision": null, "timestamp": "..."},
+    {"step": "design", ...},
+    {"step": "code", ...},
+    {"step": "verify", ...},
+    {"step": "host", ...}
+  ]
+}
+```
+
+---
+
+### 文件变更汇总
+
+| 操作 | 文件 |
+|------|------|
+| 修改 | `requirements.txt`（加 langgraph-checkpoint-mysql、playwright） |
+| 新建 | `sinan/models/contracts.py` |
+| 新建 | `sinan/harness/__init__.py` |
+| 新建 | `sinan/harness/gates.py` |
+| 新建 | `sinan/harness/state_machine.py` |
+| 新建 | `sinan/harness/validators/__init__.py` |
+| 新建 | `sinan/harness/validators/browser_validator.py` |
+| 新建 | `sinan/agents/fixer.py` |
+| 修改 | `sinan/agents/state.py`（加 iteration/max_iterations/gate_decision） |
+| 修改 | `sinan/agents/graph.py`（接入门禁节点 + Fixer 循环 + MemorySaver） |
+| 修改 | `sinan/services/generation_runner.py`（传入 iteration 初始值，感知修复轮次） |
+| 新建 | `sinan/api/routes/audit.py` |
+| 修改 | `sinan/api/app.py`（注册 audit_router） |
+| 修改 | `sinan/agents/__init__.py`（导出 FixerAgent） |
 
 ---
 

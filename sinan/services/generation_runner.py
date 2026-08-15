@@ -2,9 +2,8 @@
 import asyncio
 import logging
 
-from sinan.agents.coder import CoderAgent
-from sinan.agents.graph import build_graph
 from sinan.agents.llm import LLMClient
+from sinan.agents.graph import build_graph
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import GenSessionStep, PageVersion
 from sinan.models.enums import SessionStatus, PageStatus
@@ -46,15 +45,39 @@ class GenerationRunner:
             await self._write_step(session_id, "code", "开始生成")
 
             # 执行 LangGraph 图（内部串行执行 analyze → design → code → verify）
-            final_state = await self.graph.ainvoke({"prompt": prompt})
-
-            await self._write_step(session_id, "verify", final_state["verify_message"])
-            await event_bus.publish(
-                session_id, "verify", {"message": final_state["verify_message"]}
+            final_state = await self.graph.ainvoke(
+                {
+                    "prompt": prompt,
+                    "iteration": 0,
+                    "max_iterations": 3,
+                },
+                config={"configurable": {"thread_id": session_id}},
             )
 
-            if not final_state["verified"]:
-                raise ValueError(final_state["verify_message"])
+            # 如果经历了修复，推送修复事件
+            if final_state.get("iteration", 0) > 0:
+                await event_bus.publish(
+                    session_id,
+                    "fix",
+                    {"message": f"经过 {final_state['iteration']} 轮修复"},
+                )
+                await self._write_step(
+                    session_id, "fix",
+                    f"修复完成，共 {final_state['iteration']} 轮",
+                )
+
+                # 推送验证结果
+                await self._write_step(session_id, "verify", final_state.get("verify_message", ""))
+                await event_bus.publish(
+                    session_id, "verify",
+                    {"message": final_state.get("verify_message", "校验完成")},
+                )
+
+            if not final_state.get("verified"):
+                raise ValueError(
+                    f"验证失败（已修复 {final_state.get('iteration', 0)} 轮）："
+                    f"{final_state.get('verify_message', '未知错误')}"
+                )
 
             html = final_state["html"]
 

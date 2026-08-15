@@ -1,5 +1,6 @@
 # sinan/agents/verifier.py
 from sinan.agents.state import PageGenState
+from sinan.harness.validators.browser_validator import BrowserValidator
 
 
 class VerifierAgent:
@@ -22,6 +23,10 @@ class VerifierAgent:
             errors.append("缺少 <body> 标签")
         if len(html) < self.MIN_HTML_LENGTH:
             errors.append(f"HTML 内容过短（{len(html)} 字符），疑似生成失败")
+
+        browser_result = await BrowserValidator().validate(html)
+        if not browser_result["passed"]:
+            errors.extend(browser_result["issues"])
 
         if errors:
             return {"verified": False, "verify_message": "；".join(errors)}
