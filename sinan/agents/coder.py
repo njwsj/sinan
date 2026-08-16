@@ -1,6 +1,33 @@
 # sinan/agents/coder.py
+import json
 from sinan.agents.llm import LLMClient
 from sinan.agents.state import PageGenState
+from sinan.services.generation_event_bus import event_bus
+
+
+def _build_att_context(attachments: list) -> str:
+    """
+    从 state["attachments"] 构造代码生成用的数据上下文。
+    Coder 需要完整的 rows 才能把真实数据写进 ECharts series data。
+    对齐原项目：全量 rows，不截断。
+    """
+    if not attachments:
+        return ""
+    parts = []
+    for att in attachments:
+        parsed = att.get("parsed") or {}
+        cols = parsed.get("columns") or att.get("columns") or []
+        rows = parsed.get("rows") or []
+        row_count = parsed.get("row_count") or len(rows)
+        filename = att.get("filename", "未知文件")
+
+        parts.append(
+            f"【数据源：{filename}】\n"
+            f"字段：{', '.join(str(c) for c in cols)}\n"
+            f"共 {row_count} 行，完整数据（直接用于 ECharts series data）：\n"
+            f"{json.dumps(rows, ensure_ascii=False)}"
+        )
+    return "\n\n" + "\n\n".join(parts) + "\n\n请在图表中使用以上真实数据，字段名保持与数据源一致。"
 
 
 class CoderAgent:
@@ -21,18 +48,31 @@ class CoderAgent:
     def __init__(self, llm: LLMClient):
         self.llm = llm
 
-    async def run(self, state: PageGenState) -> str:
+    async def run(self, state: PageGenState) -> dict:
+        session_id = state.get("session_id", "")
         user_content = (
             f"用户需求：\n{state['prompt']}\n\n"
             f"需求分析：\n{state['requirements']}\n\n"
             f"设计方案：\n{state['design']}"
         )
+
+        # 从结构化 attachments 读取完整数据，注入 prompt
+        att_context = _build_att_context(state.get("attachments", []))
+        if att_context:
+            user_content += att_context
+
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
-        html = await self.llm.chat(messages, temperature=0.3)
-        return {"html": self._strip_markdown(html)}
+        html_chunks = []
+        async for token in self.llm.astream(messages, temperature=0.3):
+            html_chunks.append(token)
+            if session_id:
+                await event_bus.publish(session_id, "code_delta", {"delta": token})
+
+        html = self._strip_markdown("".join(html_chunks))
+        return {"html": html}
 
     def _strip_markdown(self, text: str) -> str:
         """

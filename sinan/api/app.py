@@ -7,6 +7,7 @@ from sinan.api.routes.health import router as health_router
 from sinan.api.routes.generate import router as generate_router
 from sinan.api.routes.preview import router as preview_router
 from sinan.api.routes.audit import router as audit_router
+from sinan.api.routes import data as data_routes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
     app.include_router(generate_router, prefix="/api/v1")     # /api/v1/generate
     app.include_router(preview_router, prefix="/api/v1")      # /api/v1/page/{marker}
     app.include_router(audit_router, prefix="/api/v1")
+    app.include_router(data_routes.router, prefix="/api/v1")
     return app
 
 # 全局 app 实例，供 uvicorn 加载：uvicorn.run("sinan.api.app:app")
