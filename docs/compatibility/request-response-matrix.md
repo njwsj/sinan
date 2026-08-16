@@ -19,3 +19,15 @@
 ## 错误协议待验证项
 
 参考项目的 `AuthenticationError` 默认码为 401（`page/core/exceptions.py:14`），但未认证访问、资源越权、Pydantic 422、业务 400 必须分别测试，不能只按异常类推断。
+
+## Step 2 差异状态
+
+> 说明：以下基于当前工作区核对。配置/日志/请求上下文/异常协议已落地，认证跳转和多环境配置待后续 Step。
+
+| 差异项 | Step 0 状态 | 当前状态 | 待验证 |
+|---|---|---|---|
+| trace_id / 访问日志 | 无 | 已实现（`app.py` 中间件 + `context.py` + `sinan-access.log`） | 需发一次请求确认日志含 trace_id 且响应可关联 |
+| 统一错误响应体 | 随机 500 | 已实现（全局 `SinanError` 处理器返回 `{"error": message}`，status=code，与参考一致） | 需触发一次 `SinanError` 确认响应体/状态码 |
+| 错误类型区分 | 不可区分 | 已实现（401/403/404/409/500 子类，`core/exceptions.py`） | 认证/越权/404/业务错误需分别黑盒验证 |
+| AuthenticationError 认证失败响应 | 未实现 | 待 Step 3（当前统一走 JSON，未接 `web_auth` 跳转） | 待 Step 3 |
+| RUN_ENV 多环境配置 | 单一 settings | 仍为单一 settings（无 dev/sandbox/online.config） | 待验证是否需纳入对齐范围 |

@@ -1,5 +1,11 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from sinan.api.context import new_trace_id, request_user_var, trace_id_var
+import time
+import logging
+from sinan.core.exceptions import SinanError
+from fastapi.responses import JSONResponse
+
 from sinan.config.settings import settings
 from sinan.core.logging import setup_logging
 from sinan.models.database import init_db
@@ -31,6 +37,27 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+    @app.middleware("http")
+    async def trace_and_access_log(request: Request, call_next):
+        """为每个请求注入 trace_id 并记录访问日志。"""
+        trace_id_var.set(new_trace_id())
+        start = time.time()
+        response = await call_next(request)
+        elapsed = int((time.time() - start) * 1000)
+        user = request_user_var.get()
+        logging.getLogger("sinan.access").info(
+            "%s\t%s\t%dms\t%s\t%s\t%d\t%s",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            request.method,
+            elapsed,
+            request.url.path,
+            str(request.query_params) if request.query_params else "",
+            response.status_code,
+            user,
+        )
+        return response
+
     # 参考项目主路径（各 router 自带 /api/page 前缀）
     app.include_router(health_router)
     app.include_router(generate_router)
@@ -47,6 +74,13 @@ def create_app() -> FastAPI:
     app.include_router(preview_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
     app.include_router(data_routes.router, prefix="/api/v1")
+
+    """全局异常处理器 - 捕获 SinanError 并返回 JSONResponse"""
+    @app.exception_handler(SinanError)
+    async def sinan_error_handler(request: Request, exc: SinanError):
+        # 与参考一致：响应体只含 error 字段，状态码用 exc.code
+        return JSONResponse(status_code=exc.code, content={"error": exc.message})
+
     return app
 
 # 全局 app 实例，供 uvicorn 加载：uvicorn.run("sinan.api.app:app")
