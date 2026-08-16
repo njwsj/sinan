@@ -29,5 +29,19 @@
 | trace_id / 访问日志 | 无 | 已实现（`app.py` 中间件 + `context.py` + `sinan-access.log`） | 需发一次请求确认日志含 trace_id 且响应可关联 |
 | 统一错误响应体 | 随机 500 | 已实现（全局 `SinanError` 处理器返回 `{"error": message}`，status=code，与参考一致） | 需触发一次 `SinanError` 确认响应体/状态码 |
 | 错误类型区分 | 不可区分 | 已实现（401/403/404/409/500 子类，`core/exceptions.py`） | 认证/越权/404/业务错误需分别黑盒验证 |
-| AuthenticationError 认证失败响应 | 未实现 | 待 Step 3（当前统一走 JSON，未接 `web_auth` 跳转） | 待 Step 3 |
+| AuthenticationError 认证失败响应 | 未实现 | 暂不实现（已评估跳过）：认证属通用工程能力，非 agent 核心，个人使用暂用固定用户 `anonymous` | 无需验证；将来需要登录时再做 Step 3 |
 | RUN_ENV 多环境配置 | 单一 settings | 仍为单一 settings（无 dev/sandbox/online.config） | 待验证是否需纳入对齐范围 |
+
+## Step 3 差异状态
+
+> 结论：**暂不实现（已评估跳过）**。Step 3（认证/资源鉴权）依赖百度 UUAP/UGate，且属于 Web 通用工程能力，对学习 agent 核心机制无帮助，故评估后跳过。
+> 保留过渡方案：沿用固定用户常量 `anonymous`（`generate.py`），使后续 Step 4+ 需要 `user_id` 的逻辑仍可运行。将来若需登录，再回头实现本 Step。
+
+| 差异项 | Step 0 状态 | 当前状态 | 说明 |
+|---|---|---|---|
+| 身份来源 | user 来自请求（`anonymous` 常量） | 暂不实现（已评估跳过） | 沿用固定用户 `anonymous`，供 Step 4+ 使用 |
+| 未认证访问受保护接口 | 无认证 | 暂不实现（已评估跳过） | 个人使用，暂不加 `login_required` |
+| body 伪造 user_id | 无该字段 | 暂不实现（已评估跳过） | `GenerateRequest` 无 `user_id`，无冒充面 |
+| 跨用户读/改 Session、Page | 无隔离 | 暂不实现（已评估跳过） | 单用户使用，暂无隔离需求 |
+| UGate Token | 未实现 | 暂不实现（已评估跳过） | 无接外部平台需求；后台 Job 需 token 时再补 |
+| 认证失败格式 | 未实现 | 暂不实现（已评估跳过） | 全局 `SinanError` 处理器仍可返回 401/403，但无接入点 |
