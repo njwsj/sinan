@@ -83,8 +83,8 @@ def build_graph(llm: LLMClient) -> StateGraph:
         {"proceed": END, "retry": "fix", "block": END},
     )
 
-    # fix 之后重新走 code（修复后重新验证）
-    graph.add_edge("fix", "code")
+    # fix 之后直接走 verify（跳过重新生成，直接验证修复结果）
+    graph.add_edge("fix", "verify")
 
     # Checkpoint：开发阶段用内存版，生产换 AsyncMySqlSaver 时只改这一行
     checkpointer = MemorySaver()

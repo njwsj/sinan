@@ -63,8 +63,12 @@ class GateEngine:
         return GateResult(decision="proceed")
 
     def _gate_code(self, state: dict) -> GateResult:
+        html = state.get("html", "")
+        # html 为空说明 coder 生成失败（LLM 无输出），无法修复，直接 block
+        if not html or not html.strip():
+            return GateResult(decision="block", reason="coder 生成 HTML 为空，无法修复")
         try:
-            contract = CodeContract(html=state.get("html", ""))
+            contract = CodeContract(html=html)
         except ValidationError as e:
             issues = [err["msg"] for err in e.errors()]
             iteration = state.get("iteration", 0)

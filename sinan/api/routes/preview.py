@@ -42,3 +42,53 @@ async def preview_page(marker: str):
         )
 
     return HTMLResponse(content=page.html_content)
+
+# sinan/api/routes/preview.py — 在现有代码基础上追加这两个端点
+
+@router.get("/page/{marker}/versions")
+async def list_versions(marker: str):
+    """列出 marker 下的所有版本（不含 html_content）。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker)
+            .order_by(desc(PageVersion.version))
+        )
+        versions = result.scalars().all()
+
+    if not versions:
+        return JSONResponse(status_code=404, content={"detail": f"页面 '{marker}' 不存在"})
+
+    return {
+        "marker": marker,
+        "versions": [
+            {
+                "version": v.version,
+                "status": v.status,
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in versions
+        ],
+    }
+
+
+@router.get("/page/{marker}/version/{version_num}")
+async def get_page_version(marker: str, version_num: int):
+    """返回指定版本的完整信息（含 html_content）。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker, PageVersion.version == version_num)
+        )
+        page = result.scalar_one_or_none()
+
+    if page is None:
+        return JSONResponse(status_code=404, content={"detail": f"版本 {version_num} 不存在"})
+
+    return {
+        "marker": page.marker,
+        "version": page.version,
+        "status": page.status,
+        "html_content": page.html_content,
+        "created_at": page.created_at.isoformat(),
+    }

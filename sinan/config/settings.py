@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     storage_type: str = "local"
     storage_local_path: str = "./output/pages"
+    attachment_storage_path: str = "/tmp/sinan_attachments"
 
     class Config:
         env_file = ".env"

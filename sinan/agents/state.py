@@ -41,3 +41,14 @@ class PageGenState(TypedDict):
     """
 
     gate_decision: str  # 当前门禁决策（proceed/retry/fix/block）
+
+    # Phase 5 新增：hydrate 后的附件列表，每项含完整 parsed 数据
+    # 结构：[{"file_id": str, "filename": str, "columns": [...],
+    #          "parsed": {"columns": [...], "rows": [...], "row_count": int}}]
+    # Runner 负责从本地文件加载 parsed，agent 按需读取，不做截断由 agent 自决。
+    attachments: list
+
+    # Phase 5 Step4 新增：会话身份，供 coder 等 agent 内部发事件使用
+    session_id: str   # 生成任务的会话 ID，和 LangGraph thread_id 相同
+    marker: str       # 页面标识（生成任务的唯一标记）
+    user_id: str      # 发起任务的用户 ID
