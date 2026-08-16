@@ -23,7 +23,12 @@ class GenerationRunner:
         self.llm = llm
         self.graph = build_graph(llm)
 
-    async def start(self, session_id: str, attachments: list[dict] | None = None) -> None:
+    async def start(
+            self,
+            session_id: str,
+            attachments: list[dict] | None = None,
+            marker: str | None = None,
+    ) -> None:
         """
         后台异步执行生成流程。
         由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
@@ -32,6 +37,7 @@ class GenerationRunner:
                      Runner 从本地文件加载完整数据（hydrate），作为结构化数据传入
                      LangGraph state["attachments"]，由各 agent 按需读取。
         """
+        resolved_marker = marker or f"page_{session_id[:8]}"
         await session_store.update(session_id, status=SessionStatus.RUNNING)
 
         try:
@@ -71,7 +77,7 @@ class GenerationRunner:
                         "iteration": 0,
                         "max_iterations": 3,
                         "session_id": session_id,  # 新增
-                        "marker": f"page_{session_id[:8]}",  # 新增
+                        "marker": resolved_marker,
                         "user_id": session.user_id if session else "system",  # 新增
                     },
                     # 这个config参数必须要传，每个 session_id 对应一个独立的 LangGraph thread，它们的 checkpoint 数据互不干扰，但底层都共享同一个进程和事件循环。
@@ -127,7 +133,7 @@ class GenerationRunner:
             return
 
         # 托管：写 page_version 表，更新 session
-        marker = f"page_{session_id[:8]}"
+        marker = resolved_marker
         version = await page_store.next_version(marker)
         await page_store.save(
             marker=marker,
@@ -136,7 +142,7 @@ class GenerationRunner:
             created_by=session.user_id if session else "system",
         )
         # 拼预览 URL（本地开发用 /page/{marker}，生产替换域名）
-        preview_url = f"/api/v1/page/{marker}"
+        preview_url = f"/api/page/preview/{marker}"
         # 更新 session：状态 DONE + marker + version + preview_url
         await session_store.update(
             session_id,

@@ -1,5 +1,5 @@
 # sinan/models/contracts.py
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field
 from typing import List
 
 """
@@ -60,3 +60,19 @@ class VerifyContract(BaseModel):
 
     def validate_content(self) -> List[str]:
         return []
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=2)
+    session_id: str | None = None
+    marker: str | None = None
+    attachments: list[dict] = Field(default_factory=list)
+    preset: str | None = None
+    template_id: str | None = None
+    prompt_template_id: str | None = None
+    datasources: list[str] = Field(default_factory=list)
+    knowledge_sources: list[str] = Field(default_factory=list)
+    skill_keys: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("skill_keys", "skillKeys"),
+    )
+    mode: str | None = None

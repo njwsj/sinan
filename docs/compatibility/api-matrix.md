@@ -56,20 +56,40 @@
 
 ## 当前 sinan API
 
-| 方法 | 路径 | 认证 | 当前行为 | 位置 |
-|---|---|---|---|---|
-| GET | `/health` | 否 | 200 JSON | `sinan/api/routes/health.py:5` |
-| POST | `/api/v1/generate` | 否 | 创建任务并返回 JSON | `sinan/api/routes/generate.py:35` |
-| GET | `/api/v1/generate/{session_id}/stream` | 否 | 内存 SSE | `sinan/api/routes/generate.py:46` |
-| GET | `/api/v1/page/{marker}` | 否 | 最新版本 HTML | `sinan/api/routes/preview.py:23` |
-| GET | `/api/v1/page/{marker}/versions` | 否 | 版本列表 | `sinan/api/routes/preview.py:48` |
-| GET | `/api/v1/page/{marker}/version/{version_num}` | 否 | 指定版本 HTML | `sinan/api/routes/preview.py:75` |
-| GET | `/api/v1/generate/{session_id}/audit` | 否 | 步骤审计 | `sinan/api/routes/audit.py:11` |
-| POST | `/api/v1/data/upload` | 否 | 本地附件解析 | `sinan/api/routes/data.py:11` |
+| 方法 | 路径 | 认证 | 当前行为 | 位置 | Step 1 后状态 |
+|---|---|---|---|---|---|
+| GET | `/health` | 否 | 200 JSON | `sinan/api/routes/health.py:5` | 保留 |
+| POST | `/api/v1/generate` | 否 | 创建任务并返回 JSON | `sinan/api/routes/generate.py:35` | 保留为兼容旧路径 |
+| GET | `/api/v1/generate/{session_id}/stream` | 否 | 内存 SSE | `sinan/api/routes/generate.py:46` | 保留为兼容旧路径 |
+| POST | `/api/page/generate` | 否（Step 3 加认证） | 200 SSE，直接流式返回（已实现） | `sinan/api/routes/generate.py:68` | **Step 1 已实现** |
+| GET | `/api/v1/page/{marker}` | 否 | 最新版本 HTML | `sinan/api/routes/preview.py:23` | 保留 |
+| GET | `/api/v1/page/{marker}/versions` | 否 | 版本列表 | `sinan/api/routes/preview.py:48` | 保留 |
+| GET | `/api/v1/page/{marker}/version/{version_num}` | 否 | 指定版本 HTML | `sinan/api/routes/preview.py:75` | 保留 |
+| GET | `/api/page/preview/{marker}` | 否 | 最新版本 HTML | `sinan/api/routes/preview.py`（Step 1 待实施） | **Step 1 待实施** |
+| GET | `/api/page/preview/{marker}/v{version}` | 否 | 指定版本 HTML | `sinan/api/routes/preview.py`（Step 1 待实施） | **Step 1 待实施** |
+| GET | `/api/v1/generate/{session_id}/audit` | 否 | 步骤审计 | `sinan/api/routes/audit.py:11` | 保留 |
+| POST | `/api/v1/data/upload` | 否 | 本地附件解析 | `sinan/api/routes/data.py:11` | 保留 |
+| GET | `/api/page/session/{session_id}` | 否（Step 3 加认证） | 桩实现，待 Step 4 填充 | `sinan/api/routes/session.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
+| GET | `/api/page/pages/{marker}/versions` | 否（Step 3 加认证） | 桩实现，待 Step 10 填充 | `sinan/api/routes/pages.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
+| POST | `/api/page/upload` | 否（Step 3 加认证） | 桩实现，待 Step 9 填充 | `sinan/api/routes/upload.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
 
-## 已确认差异
+## 已确认差异（Step 0 基线）
 
 - 路径前缀、资源 API、认证层和请求语义不一致。
 - 参考生成请求校验 `prompt` 最短 2 个字符；当前请求模型未声明该约束。
 - 参考生成建立 SSE；当前 POST 返回普通 JSON，SSE 需要另行 GET。
 - 当前没有参考项目的 Session、Job、确认、取消、恢复、模板、Skill、Artifact 和发布 API。
+
+## Step 1 差异状态
+
+> 说明：以下状态基于当前工作区（分支 `phase-6`，未提交改动）核对。生成侧已落地，资源侧路由/预览兼容路由尚未落地。
+
+| 差异项 | Step 0 状态 | 当前状态 | 待验证 |
+|---|---|---|---|
+| 生成 API 主路径 `/api/page/generate` | 缺失 | 已实现（`generate.py:68`，直接返回 SSE） | 需运行 `curl -N POST /api/page/generate` 确认流式响应 |
+| `prompt` 最小长度校验（min=2） | 无约束 | 已实现（`contracts.py:65` `Field(..., min_length=2)`，与参考一致） | 需运行空/单字符 prompt 确认 422 |
+| `session_id`/`marker`/`mode` 等字段 | 缺失 | 已实现（`contracts.py:64-78`，字段集与参考完全一致） | 字段接收，内部暂不使用 |
+| 预览路径 `/api/page/preview/{marker}`、`/v{version}` | 缺失 | **待实施**（现仅有 `/api/v1/page/{marker}`） | 添加兼容路由后访问确认 HTML 响应 |
+| 认证 | 无 | 无（Step 3 加） | 仍待解决 |
+| Session/Job/确认/取消/恢复 API | 缺失 | **待实施**（session/pages/upload 桩文件尚未创建） | 待 Step 1 建桩、Step 4-10 实现 |
+| `POST /api/page/generate` SSE 使用内存 Queue | — | 是（与参考项目 Redis replay 仍不同） | 待 Step 5 替换 |
