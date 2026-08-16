@@ -11,9 +11,9 @@
 | 5 | 页面生成失败 | 有，SSE error | 部分 | error payload/状态 |
 | 6 | 生成中客户端断线 | 有 | 部分 | Redis 保留事件 |
 | 7 | 完成后重新连接 | 有 | 缺失 | Last-Event-ID/终态回放 |
-| 8 | 取消生成 | 有 abort | 缺失 | 取消状态和事件 |
-| 9 | 服务重启恢复 | 有 Job Supervisor | 缺失 | lease/retry |
-| 10 | 复用已有 Session | 有 | 缺失 | session_id 语义 |
+| 8 | 取消生成 | 有 abort | 部分（Step 4） | Redis `cancel_registry` 支持运行中节点边界打断+cancelled 事件；打断粒度/事件顺序待黑盒验证 |
+| 9 | 服务重启恢复 | 有 Job Supervisor | 部分（Step 4） | lease/retry/supervisor 已具备，待黑盒验证 |
+| 10 | 复用已有 Session | 有 | 部分（Step 4） | `create_or_get_job` 按 session 复用活动 Job，session_id 语义待验证 |
 | 11 | 修改已有页面 | 有 iterate | 缺失 | 版本和上下文 |
 | 12 | 用户确认 | 有 confirm | 缺失 | awaiting/confirmed |
 | 13 | 用户拒绝 | 有 confirm(false) | 缺失 | rejected/反馈 |

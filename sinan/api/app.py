@@ -32,8 +32,18 @@ async def lifespan(app: FastAPI):
     # 服务器启动时：初始化日志和数据库
     setup_logging(settings.debug)
     await init_db()
+    from sinan.services.generation_supervisor import start_supervisor, stop_supervisor
+    await start_supervisor()
     yield
     # 服务器关闭时：在此处添加清理逻辑
+    """
+    日志 → 数据库 → supervisor 启动；
+    关闭时先停 supervisor（取消本地 run_job，未完成 Job 靠租约过期在下次启动恢复），
+    再关 Redis，最后框架关数据库。Redis 懒加载，首次取消才建连。
+    """
+    await stop_supervisor()
+    from sinan.services.redis import close_redis
+    await close_redis()
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)

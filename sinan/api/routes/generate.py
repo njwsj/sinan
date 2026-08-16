@@ -11,6 +11,9 @@ from sinan.models.contracts import GenerateRequest
 from sinan.services.generation_event_bus import event_bus
 from sinan.services.generation_runner import generation_runner
 from sinan.services.session_store import session_store
+from sinan.services.generation_job_store import generation_job_store
+from sinan.services.generation_supervisor import ensure_job_running
+from sinan.services import cancel_registry
 
 """
 POST /api/v1/generate：
@@ -51,23 +54,23 @@ async def _create_or_reuse_generation(
     后续用相同 session_id 再 POST（比如客户端断线后重连）：
     created=False → 不重复起任务，只是重新订阅这个 session 的 SSE 事件流。
     """
-    _, created = await session_store.create_or_get(
+    await session_store.create_or_get(
         session_id=session_id,
         user_id=_TRANSITIONAL_USER_ID,
         prompt=req.prompt,
         marker=marker,
     )
 
-    if created:
-        asyncio.create_task(
-            generation_runner.start(
-                session_id,
-                req.attachments,
-                marker=marker,
-            )
-        )
+    payload = req.model_dump(mode="json")
+    result = await generation_job_store.create_or_get_job(
+        session_id=session_id, marker=marker, user_id=_TRANSITIONAL_USER_ID,
+        payload=payload, reconnect=bool(req.session_id),
+    )
 
-    return session_id, marker, created
+    if result.created:
+        ensure_job_running(result.job.job_id)
+
+    return session_id, marker, result.created
 
 
 
@@ -103,3 +106,9 @@ async def stream_generation(session_id: str):
             yield {"event": evt.type, "data": json.dumps(evt.data, ensure_ascii=False)}
 
     return EventSourceResponse(event_generator())
+
+@router.post("/generate/{session_id}/cancel")
+async def cancel_generation(session_id: str):
+    await cancel_registry.cancel_async(session_id)                    # Redis 取消信号 → 运行中 worker 节点边界感知
+    await generation_job_store.request_cancel(session_id=session_id)  # pending / 其它实例的 Job 直接置 cancelled
+    return {"session_id": session_id, "status": "cancelling"}

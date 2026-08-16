@@ -3,7 +3,7 @@
 | 对象 | 参考项目 | 当前 sinan | 差异 |
 |---|---|---|---|
 | Session | `GenerationSession`，含用户、状态、步骤、需求、marker 等 | `gen_session`，`sinan/models/tables.py:8-37` | 字段/状态不同 |
-| Job | `GenerationJob`，MySQL 持久化、租约和重连复用 | 无独立表 | 缺失 |
+| Job | `GenerationJob`，MySQL 持久化、租约和重连复用 | `generation_job`（Step 4 方案），MySQL 持久化、原子租约、`create_or_get_job` 复用 | 结构已对齐；status 用字符串常量，无 title/messages 等 Session 专属列 |
 | 步骤 | session 消息/审计及运行时记录 | `gen_session_step`，`tables.py:40-61` | 事件与存储未统一 |
 | Page | 参考 `Page` | 无独立 Page ORM | 缺失 |
 | PageVersion | 参考版本快照，BOS 存储 | `page_version`，HTML/source_code 直接入库 | 存储介质和发布元数据不同 |

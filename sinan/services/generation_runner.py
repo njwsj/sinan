@@ -13,6 +13,14 @@ from sinan.services.session_store import session_store
 from sinan.services.generation_event_bus import event_bus
 from sinan.config.settings import settings
 from sinan.services.page_store import page_store
+import uuid
+import socket
+from contextlib import suppress
+from sinan.services.generation_job_store import generation_job_store, CANCELLED
+from sinan.services import cancel_registry
+_OWNER = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
+_LEASE_SECONDS = 90
+_HEARTBEAT_SECONDS = 20
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +31,7 @@ class GenerationRunner:
         self.llm = llm
         self.graph = build_graph(llm)
 
-    async def start(
-            self,
-            session_id: str,
-            attachments: list[dict] | None = None,
-            marker: str | None = None,
-    ) -> None:
+    async def _execute_generation_pipeline(self, job) -> None:
         """
         后台异步执行生成流程。
         由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
@@ -37,8 +40,14 @@ class GenerationRunner:
                      Runner 从本地文件加载完整数据（hydrate），作为结构化数据传入
                      LangGraph state["attachments"]，由各 agent 按需读取。
         """
+        payload = dict(job.request_payload or {})
+        session_id = job.session_id
+        marker = job.marker or f"page_{session_id[:8]}"
+        attachments = payload.get("attachments") or []
+
         resolved_marker = marker or f"page_{session_id[:8]}"
         await session_store.update(session_id, status=SessionStatus.RUNNING)
+        await cancel_registry.clear_async(session_id)
 
         try:
             session = await session_store.get(session_id)
@@ -84,6 +93,13 @@ class GenerationRunner:
                     config={"configurable": {"thread_id": session_id}},
                     version="v2",
             ):
+                # —— 运行中取消检测（节点边界，跨实例） ——
+                if await cancel_registry.is_cancelled_async(session_id):
+                    await generation_job_store.request_cancel(job_id=job.job_id)
+                    await session_store.update(session_id, status=SessionStatus.FAILED)  # Step 6 可换成 CANCELLED 枚举
+                    await event_bus.publish(session_id, "cancelled", {"message": "已取消生成"})
+                    await event_bus.publish_done(session_id)
+                    return  # 正常返回，run_job 复查到 cancelled 不置 completed
                 kind = event["event"]
                 name = event.get("name", "")
 
@@ -126,9 +142,12 @@ class GenerationRunner:
             html = final_state["html"]
 
         except Exception as e:
+            """
+            注意：原 start() 内部 except 里对 session 的 FAILED 终态写入建议去掉（保留推 error 事件即可），
+            让终态统一由 run_job 决定。异常直接抛出交给 run_job 接住。
+            """
             logger.exception("generation failed for session %s", session_id)
             await event_bus.publish(session_id, "error", {"message": f"生成失败：{e}"})
-            await session_store.update(session_id, status=SessionStatus.FAILED)
             await event_bus.publish_done(session_id)
             return
 
@@ -185,6 +204,52 @@ class GenerationRunner:
         async with AsyncSessionLocal() as db:
             db.add(record)
             await db.commit()
+
+
+    async def run_job(self, job_id: str) -> None:
+        """领取并执行一个 Job：抢租约 → 心跳续租 → 执行流水线 → finalize。"""
+
+        """
+        因为同一个 Job 可能被多个执行者同时看到并想跑
+        多实例部署：sinan 起了 3 个进程（或 3 个 pod）。它们的 supervisor 都在每 15s 扫 list_reclaimable_jobs()。同一个 pending Job，很可能被 3 个进程同时扫到，3 个都想 run_job。
+        """
+        job = await generation_job_store.claim_job(job_id, _OWNER, _LEASE_SECONDS)
+        if not job:
+            return  # 没抢到（已被别人持有 / 终态 / 达上限）
+        """
+        光抢到租约还不够，因为抢到的 worker 也可能中途挂掉（进程崩溃、OOM、机器宕机、网络断）。这时候问题来了：
+        别的 worker 怎么知道"这个 running 的 Job 是还在跑，还是持有者已经死了"?
+        答案就是租约的"到期时间"lease_until。约定：只要我还活着、还在跑这个 Job，
+        我就周期性地把 lease_until 往后推——这就是心跳
+        （_heartbeat_loop 每 20s 调一次 heartbeat，把 lease_until 续到 now+90s）。
+        """
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(job_id))
+        try:
+            await self._execute_generation_pipeline(job)
+            latest = await generation_job_store.get_job(job_id)   # finalize 前复查
+            if latest and latest.status == CANCELLED:
+                return                                            # 被取消：不置 completed
+            await generation_job_store.mark_completed(job_id, _OWNER)
+        except asyncio.CancelledError:
+            raise                                                 # 关机取消：交给下次恢复，不置 failed
+        except Exception as e:
+            logger.exception("generation job failed: job_id=%s", job_id)
+            # 失败：置 failed，supervisor_loop 主要是针对进程崩溃这种情况，干净异常失败（LLM 报错、验证抛异常）因为这类失败重跑大概率还是同样结果，自动重试没意义，交给用户重新发起。
+            await generation_job_store.mark_failed(job_id, _OWNER, str(e) or type(e).__name__)
+            await session_store.update(job.session_id, status=SessionStatus.FAILED)
+        finally:
+            # 确保心跳任务被取消，避免僵尸任务
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+    async def _heartbeat_loop(self, job_id: str) -> None:
+        while True:
+            await asyncio.sleep(_HEARTBEAT_SECONDS)
+            ok = await generation_job_store.heartbeat(job_id, _OWNER, _LEASE_SECONDS)
+            if not ok:
+                logger.warning("heartbeat lost ownership: job_id=%s", job_id)
+                return
 
 
 # 模块级单例：用 settings 里的配置初始化 LLM 和 CoderAgent
