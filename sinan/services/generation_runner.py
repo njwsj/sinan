@@ -136,7 +136,7 @@ class GenerationRunner:
             created_by=session.user_id if session else "system",
         )
         # 拼预览 URL（本地开发用 /page/{marker}，生产替换域名）
-        preview_url = f"/page/{marker}"
+        preview_url = f"/api/v1/page/{marker}"
         # 更新 session：状态 DONE + marker + version + preview_url
         await session_store.update(
             session_id,

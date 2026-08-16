@@ -1,0 +1,75 @@
+# API 兼容性矩阵
+
+本矩阵是 Step 0 的行为基线。参考实现位于
+`/Users/zhanghj/Documents/baidu/project/baidu/gcloud/page/page`；状态码和认证结论以源码为准，尚未替代真实服务的黑盒验证。
+
+## 参考项目公开 API
+
+| 方法 | 路径 | 认证 | 成功 | 参考位置 |
+|---|---|---|---|---|
+| GET | `/api/page/health` | 否 | 200 JSON | `page/api/routes/health.py:5` |
+| GET | `/api/page/ready` | 否 | 200 JSON | `page/api/routes/health.py:14` |
+| GET | `/api/v1/callbackUrl` | UUAP 回调 | 302 | `page/api/routes/auth.py:18` |
+| GET | `/api/v1/loginUser` | 是 | 200 JSON | `page/api/routes/auth.py:32` |
+| POST | `/api/page/generate` | 是 | 200 SSE | `page/api/routes/generate.py:47` |
+| GET | `/api/page/ugate-token/cache/refresh` | 是 | 200 JSON | `page/api/routes/generate.py:81` |
+| POST | `/api/page/upload` | 是 | 200 JSON | `page/api/routes/upload.py:134` |
+| POST | `/api/page/host` | 当前无显式依赖 | 200 JSON | `page/api/routes/hosting.py:28` |
+| GET/POST/PUT/DELETE | `/api/page/proxy/{marker}/{path:path}` | 当前无显式依赖 | 上游状态 | `page/api/routes/proxy.py:14` |
+| GET | `/api/page/preview/{marker}` | 否 | 200 HTML | `page/api/routes/preview.py:41` |
+| GET | `/api/page/preview/{marker}/v{version}` | 否 | 200 HTML | `page/api/routes/preview.py:54` |
+| GET | `/api/page/preview/{marker}/live/{session_id}` | 否 | 200 HTML | `page/api/routes/preview.py:64` |
+| GET | `/api/page/pages/{marker}/versions` | 是 | 200 JSON | `page/api/routes/pages.py:18` |
+| GET | `/api/page/pages/{marker}/data` | 是 | 200 JSON | `page/api/routes/pages.py:41` |
+| GET | `/api/page/pages/{marker}/download/{file_id}` | 是 | 200 文件流 | `page/api/routes/pages.py:48` |
+| GET | `/api/page/pages/{marker}/messages` | 是 | 200 JSON | `page/api/routes/pages.py:67` |
+| GET | `/api/page/pages/{marker}/artifacts` | 是 | 200 JSON | `page/api/routes/pages.py:74` |
+| GET | `/api/page/pages/{marker}/artifacts/{artifact_type:path}` | 是 | 200 内容 | `page/api/routes/pages.py:81` |
+| GET | `/api/page/session/{session_id}` | 是 | 200 JSON | `page/api/routes/session.py:331` |
+| GET | `/api/page/session/{session_id}/messages` | 是 | 200 JSON | `page/api/routes/session.py:265` |
+| GET | `/api/page/session/{session_id}/code` | 是 | 200 JSON | `page/api/routes/session.py:282` |
+| POST | `/api/page/session/{session_id}/code` | 是 | 200 JSON | `page/api/routes/session.py:301` |
+| POST | `/api/page/session/{session_id}/resume` | 是 | 200 SSE | `page/api/routes/session.py:350` |
+| POST | `/api/page/session/{session_id}/confirm` | 是 | 200 SSE | `page/api/routes/session.py:417` |
+| GET | `/api/page/session/{session_id}/harness` | 是 | 200 JSON | `page/api/routes/session.py:696` |
+| POST | `/api/page/session/{session_id}/iterate` | 是 | 200 SSE | `page/api/routes/session.py:713` |
+| GET | `/api/page/session/{session_id}/generation-job` | 是 | 200 JSON | `page/api/routes/session.py:1546` |
+| GET | `/api/page/session/{session_id}/events` | 是 | 200 SSE | `page/api/routes/session.py:1582` |
+| POST | `/api/page/session/{session_id}/abort` | 是 | 200 JSON | `page/api/routes/session.py:1599` |
+| GET | `/api/page/session/{session_id}/data` | 是 | 200 JSON | `page/api/routes/session.py:1612` |
+| GET | `/api/page/session/{session_id}/download/{file_id}` | 是 | 200 文件流 | `page/api/routes/session.py:1619` |
+| GET | `/api/page/s` | 是 | 200 JSON | `page/api/routes/session.py:1637` |
+| POST | `/api/page/templates` | 是 | 200 JSON | `page/api/routes/template.py:17` |
+| PATCH | `/api/page/templates/{template_id}/offline` | 是 | 200 JSON | `page/api/routes/template.py:73` |
+| GET | `/api/page/templates` | 是 | 200 JSON | `page/api/routes/template.py:89` |
+| GET | `/api/page/prompt/templates` | 是 | 200 JSON | `page/api/routes/prompt_template.py:15` |
+| GET | `/api/page/prompt/templates/{template_id}` | 是 | 200 JSON | `page/api/routes/prompt_template.py:41` |
+| GET | `/api/page/admin/skills` | 是 | 200 JSON | `page/api/routes/admin_skills.py:152` |
+| POST | `/api/page/admin/skills/install` | 是 | 200 JSON | `page/api/routes/admin_skills.py:167` |
+| PATCH | `/api/page/admin/skills/{skill_key}/status` | 是 | 200 JSON | `page/api/routes/admin_skills.py:178` |
+| PATCH | `/api/page/admin/skills/{skill_key}` | 是 | 200 JSON | `page/api/routes/admin_skills.py:191` |
+| DELETE | `/api/page/admin/skills/{skill_key}` | 是 | 200 JSON | `page/api/routes/admin_skills.py:209` |
+| GET | `/api/page/buddy` | 是 | 200 JSON | `page/api/routes/buddy.py:21` |
+| POST | `/api/page/buddy/profile` | 是 | 200 JSON | `page/api/routes/buddy.py:28` |
+| POST | `/api/page/buddy/pet` | 是 | 200 JSON | `page/api/routes/buddy.py:35` |
+| GET | `/api/page/trace/{session_id}` | 否 | 200 JSON | `page/api/routes/trace.py:163` |
+
+## 当前 sinan API
+
+| 方法 | 路径 | 认证 | 当前行为 | 位置 |
+|---|---|---|---|---|
+| GET | `/health` | 否 | 200 JSON | `sinan/api/routes/health.py:5` |
+| POST | `/api/v1/generate` | 否 | 创建任务并返回 JSON | `sinan/api/routes/generate.py:35` |
+| GET | `/api/v1/generate/{session_id}/stream` | 否 | 内存 SSE | `sinan/api/routes/generate.py:46` |
+| GET | `/api/v1/page/{marker}` | 否 | 最新版本 HTML | `sinan/api/routes/preview.py:23` |
+| GET | `/api/v1/page/{marker}/versions` | 否 | 版本列表 | `sinan/api/routes/preview.py:48` |
+| GET | `/api/v1/page/{marker}/version/{version_num}` | 否 | 指定版本 HTML | `sinan/api/routes/preview.py:75` |
+| GET | `/api/v1/generate/{session_id}/audit` | 否 | 步骤审计 | `sinan/api/routes/audit.py:11` |
+| POST | `/api/v1/data/upload` | 否 | 本地附件解析 | `sinan/api/routes/data.py:11` |
+
+## 已确认差异
+
+- 路径前缀、资源 API、认证层和请求语义不一致。
+- 参考生成请求校验 `prompt` 最短 2 个字符；当前请求模型未声明该约束。
+- 参考生成建立 SSE；当前 POST 返回普通 JSON，SSE 需要另行 GET。
+- 当前没有参考项目的 Session、Job、确认、取消、恢复、模板、Skill、Artifact 和发布 API。
