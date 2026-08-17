@@ -92,3 +92,49 @@ async def get_page_version(marker: str, version_num: int):
         "html_content": page.html_content,
         "created_at": page.created_at.isoformat(),
     }
+
+
+# ============================================================
+# 参考项目兼容路由：/api/page/preview/...
+# 参考位置 page/api/routes/preview.py:41-61
+# 参考实现依赖 PreviewService + BOS（Step 9/10），Step 1 先用 PageVersion 表做兼容映射
+# ============================================================
+page_router = APIRouter(prefix="/api/page", tags=["preview"])
+
+
+@page_router.get("/preview/{marker}", response_class=HTMLResponse)
+async def preview_latest_compat(marker: str):
+    """参考兼容：返回 marker 最新版本 HTML。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker)
+            .order_by(desc(PageVersion.version))
+            .limit(1)
+        )
+        page = result.scalar_one_or_none()
+
+    if page is None:
+        return HTMLResponse(
+            content=f"<html><body><h2>页面未找到</h2><p>'{marker}' 尚未生成。</p></body></html>",
+            status_code=404,
+        )
+    return HTMLResponse(content=page.html_content or "")
+
+
+@page_router.get("/preview/{marker}/v{version}", response_class=HTMLResponse)
+async def preview_version_compat(marker: str, version: int):
+    """参考兼容：返回 marker 指定版本 HTML（路径形如 /preview/foo/v2）。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker, PageVersion.version == version)
+        )
+        page = result.scalar_one_or_none()
+
+    if page is None:
+        return HTMLResponse(
+            content=f"<html><body><h2>版本未找到</h2><p>{marker} v{version} 不存在。</p></body></html>",
+            status_code=404,
+        )
+    return HTMLResponse(content=page.html_content or "")

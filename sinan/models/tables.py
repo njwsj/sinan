@@ -85,3 +85,33 @@ class PageVersion(Base):
         UniqueConstraint("marker", "version", name="uk_marker_version"),
         Index("idx_marker", "marker"),
     )
+
+class GenerationJob(Base):
+    """生成任务表：为每次生成请求提供可持久化、可租约、可恢复的任务生命周期"""
+    __tablename__ = "generation_job"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True, comment="自增主键")
+    job_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, comment="任务ID")
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="所属会话ID")
+    marker: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="页面标识")
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="用户ID")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", comment="任务状态")
+    request_payload: Mapped[dict] = mapped_column(JSON, nullable=False, comment="重放生成所需的请求负载")
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="租约持有worker")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="租约到期时间")
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="最近心跳时间")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="已尝试次数")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, comment="最大尝试次数")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True, comment="错误信息")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="开始执行时间")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="结束时间")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间"
+    )
+
+    __table_args__ = (
+        Index("idx_job_session", "session_id"),
+        Index("idx_job_status", "status"),
+        Index("idx_job_lease", "lease_until"),
+    )
