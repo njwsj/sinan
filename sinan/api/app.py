@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 from sinan.api.context import new_trace_id, request_user_var, trace_id_var
 import time
 import logging
 from sinan.core.exceptions import SinanError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from sinan.config.settings import settings
 from sinan.core.logging import setup_logging
@@ -86,12 +87,11 @@ def create_app() -> FastAPI:
     app.include_router(audit_router, prefix="/api/v1")
     app.include_router(data_routes.router, prefix="/api/v1")
 
-    # 本地调试页：可视化 SSE 事件流（同源，避免 CORS）
-    _DEBUG_PAGE = Path(__file__).resolve().parent.parent / "static" / "debug.html"
-
-    @app.get("/debug", include_in_schema=False)
-    async def debug_console():
-        return FileResponse(_DEBUG_PAGE, media_type="text/html")
+    # 本地调试页：sinan/static/debug/ 下的 html 直接按文件名访问，
+    # 例如 /debug/phase6.html。各 phase 各放一个文件，这里不用改，合回 main 不冲突。
+    _DEBUG_DIR = Path(__file__).resolve().parent.parent / "static" / "debug"
+    if _DEBUG_DIR.is_dir():
+        app.mount("/debug", StaticFiles(directory=_DEBUG_DIR), name="debug")
 
     """全局异常处理器 - 捕获 SinanError 并返回 JSONResponse"""
 

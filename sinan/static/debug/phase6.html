@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>Sinan 调试台 - SSE 事件流</title>
+<title>Sinan 调试台 phase-6 - SSE 事件流</title>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font: 13px/1.6 -apple-system, "PingFang SC", monospace; background: #f6f7f9; color: #24292f; }
@@ -40,7 +40,7 @@
 </head>
 <body>
 <header>
-  <b>Sinan 调试台</b>
+  <b>Sinan 调试台 · phase-6</b>
   <input id="base" style="width: 210px; padding: 2px 6px;" />
   <span class="pill" id="status">idle</span>
   <span class="base" id="tip"></span>
@@ -101,11 +101,11 @@ const $ = (id) => document.getElementById(id);
 
 // 用 file:// 直接打开时 location.origin 是 "null"，拼出来会变成 file:///api/...；
 // 这种情况下退回默认后端地址，但浏览器仍会因 CORS 拦请求，
-// 正确用法是访问 http://127.0.0.1:8000/debug（同源）。
+// 正确用法是访问 http://127.0.0.1:8000/debug/phase6.html（同源）。
 const IS_FILE = window.location.protocol === 'file:';
 $('base').value = IS_FILE ? 'http://127.0.0.1:8000' : window.location.origin;
 $('tip').textContent = IS_FILE
-  ? '当前是 file:// 打开，请改用 http://127.0.0.1:8000/debug'
+  ? '当前是 file:// 打开，请改用 http://127.0.0.1:8000/debug/phase6.html'
   : '';
 const B = () => $('base').value.trim().replace(/\/+$/, '');
 
