@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, Request
 from sinan.api.context import new_trace_id, request_user_var, trace_id_var
 import time
 import logging
 from sinan.core.exceptions import SinanError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from sinan.config.settings import settings
 from sinan.core.logging import setup_logging
@@ -85,7 +86,15 @@ def create_app() -> FastAPI:
     app.include_router(audit_router, prefix="/api/v1")
     app.include_router(data_routes.router, prefix="/api/v1")
 
+    # 本地调试页：可视化 SSE 事件流（同源，避免 CORS）
+    _DEBUG_PAGE = Path(__file__).resolve().parent.parent / "static" / "debug.html"
+
+    @app.get("/debug", include_in_schema=False)
+    async def debug_console():
+        return FileResponse(_DEBUG_PAGE, media_type="text/html")
+
     """全局异常处理器 - 捕获 SinanError 并返回 JSONResponse"""
+
     @app.exception_handler(SinanError)
     async def sinan_error_handler(request: Request, exc: SinanError):
         # 与参考一致：响应体只含 error 字段，状态码用 exc.code

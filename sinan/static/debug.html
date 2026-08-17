@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Sinan 调试台 - SSE 事件流</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.6 -apple-system, "PingFang SC", monospace; background: #f6f7f9; color: #24292f; }
+  header { padding: 10px 16px; background: #24292f; color: #fff; display: flex; gap: 12px; align-items: center; }
+  header b { font-size: 15px; }
+  header .base { font-size: 12px; opacity: .7; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 12px; padding: 12px; align-items: start; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; }
+  label { display: block; margin: 8px 0 3px; font-size: 12px; color: #57606a; }
+  input, textarea, select, button { font: inherit; width: 100%; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 5px; }
+  textarea { min-height: 76px; resize: vertical; }
+  button { background: #1f6feb; color: #fff; border-color: #1f6feb; cursor: pointer; }
+  button.sec { background: #f6f8fa; color: #24292f; border-color: #d0d7de; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; background: #eaeef2; }
+  .pill.run { background: #ddf4ff; color: #0969da; }
+  .pill.done { background: #dafbe1; color: #1a7f37; }
+  .pill.err { background: #ffebe9; color: #cf222e; }
+  #log { max-height: 46vh; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 6px; border-bottom: 1px solid #eaeef2; vertical-align: top; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  td.t { width: 88px; color: #8c959f; white-space: nowrap; }
+  td.e { width: 110px; font-weight: 600; }
+  td.d { white-space: pre-wrap; word-break: break-all; }
+  tr.ev-error td.e { color: #cf222e; }
+  tr.ev-done td.e { color: #1a7f37; }
+  pre#raw { max-height: 26vh; overflow: auto; background: #0d1117; color: #c9d1d9; padding: 8px; border-radius: 5px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
+  iframe { width: 100%; height: 420px; border: 1px solid #d0d7de; border-radius: 5px; background: #fff; }
+  .files { font-size: 12px; }
+  .files div { padding: 3px 0; border-bottom: 1px dashed #eaeef2; }
+  a { color: #0969da; }
+</style>
+</head>
+<body>
+<header>
+  <b>Sinan 调试台</b>
+  <input id="base" style="width: 210px; padding: 2px 6px;" />
+  <span class="pill" id="status">idle</span>
+  <span class="base" id="tip"></span>
+</header>
+<main>
+  <div>
+    <div class="card">
+      <h3>1. 上传 Excel（POST /api/v1/data/upload）</h3>
+      <input type="file" id="file" accept=".xlsx,.xls" />
+      <div class="row">
+        <button class="sec" id="btnUpload">上传解析</button>
+        <button class="sec" id="btnClearFiles">清空附件</button>
+      </div>
+      <label>已选附件（作为 attachments 传给 generate）</label>
+      <div class="files" id="files">（空）</div>
+    </div>
+
+    <div class="card">
+      <h3>2. 发起生成</h3>
+      <label>prompt</label>
+      <textarea id="prompt">用上传的数据做一个销售分析看板，包含折线图和柱状图</textarea>
+      <label>session_id（留空自动生成）</label>
+      <input id="sid" />
+      <label>marker（留空自动生成）</label>
+      <input id="marker" />
+      <label>方式</label>
+      <select id="mode">
+        <option value="post">POST /api/page/generate（响应即 SSE，fetch 流式解析）</option>
+        <option value="legacy">POST /api/v1/generate → GET .../stream（EventSource）</option>
+      </select>
+      <div class="row">
+        <button id="btnStart">开始生成</button>
+        <button class="sec" id="btnCancel">取消</button>
+      </div>
+      <div class="row">
+        <button class="sec" id="btnReconnect">重连事件流</button>
+        <button class="sec" id="btnClearLog">清空日志</button>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h3>3. SSE 事件（解析后）<span id="count" class="pill">0</span></h3>
+      <div id="log"><table id="logTable"></table></div>
+    </div>
+    <div class="card">
+      <h3>4. 原始报文</h3>
+      <pre id="raw"></pre>
+    </div>
+    <div class="card">
+      <h3>5. 预览 <span id="previewLink"></span></h3>
+      <iframe id="preview"></iframe>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+
+// 用 file:// 直接打开时 location.origin 是 "null"，拼出来会变成 file:///api/...；
+// 这种情况下退回默认后端地址，但浏览器仍会因 CORS 拦请求，
+// 正确用法是访问 http://127.0.0.1:8000/debug（同源）。
+const IS_FILE = window.location.protocol === 'file:';
+$('base').value = IS_FILE ? 'http://127.0.0.1:8000' : window.location.origin;
+$('tip').textContent = IS_FILE
+  ? '当前是 file:// 打开，请改用 http://127.0.0.1:8000/debug'
+  : '';
+const B = () => $('base').value.trim().replace(/\/+$/, '');
+
+let attachments = [];
+let es = null;          // EventSource（legacy 模式）
+let abort = null;       // AbortController（post 模式）
+let evCount = 0;
+
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random())).replace(/-/g, '');
+const now = () => new Date().toTimeString().slice(0, 8) + '.' + String(Date.now() % 1000).padStart(3, '0');
+
+function setStatus(text, cls) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = 'pill' + (cls ? ' ' + cls : '');
+}
+
+function raw(text) {
+  $('raw').textContent += text;
+  $('raw').scrollTop = $('raw').scrollHeight;
+}
+
+function logEvent(event, data) {
+  evCount += 1;
+  $('count').textContent = evCount;
+  const tr = $('logTable').insertRow();
+  tr.className = 'ev-' + event;
+  tr.innerHTML = `<td class="t">${now()}</td><td class="e">${event}</td><td class="d"></td>`;
+  tr.cells[2].textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 0);
+  $('log').scrollTop = $('log').scrollHeight;
+
+  if (event === 'done') {
+    setStatus('done', 'done');
+    const obj = typeof data === 'string' ? safeJson(data) : data;
+    if (obj && obj.preview_url) {
+      $('preview').src = B() + obj.preview_url;
+      $('previewLink').innerHTML = `<a href="${B() + obj.preview_url}" target="_blank">${obj.preview_url}</a>`;
+    }
+  } else if (event === 'error') {
+    setStatus('error', 'err');
+  } else if (event === 'cancelled') {
+    setStatus('cancelled', 'err');
+  }
+}
+
+function safeJson(s) { try { return JSON.parse(s); } catch (e) { return null; } }
+
+function renderFiles() {
+  $('files').innerHTML = attachments.length
+    ? attachments.map(a => `<div>${a.filename} · ${a.row_count} 行 · ${(a.columns || []).join(', ')}<br><small>file_id=${a.file_id}</small></div>`).join('')
+    : '（空）';
+}
+
+$('btnUpload').onclick = async () => {
+  const f = $('file').files[0];
+  if (!f) { alert('先选一个 .xlsx / .xls 文件'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  const resp = await fetch(B() + '/api/v1/data/upload', { method: 'POST', body: fd });
+  const body = await resp.json();
+  if (!resp.ok) { alert('上传失败：' + JSON.stringify(body)); return; }
+  attachments.push({
+    file_id: body.file_id, filename: body.filename,
+    columns: body.columns || [], row_count: body.row_count || 0,
+  });
+  renderFiles();
+  raw('# upload ok ' + JSON.stringify(body).slice(0, 500) + '\n');
+};
+
+$('btnClearFiles').onclick = () => { attachments = []; renderFiles(); };
+
+$('btnClearLog').onclick = () => {
+  $('logTable').innerHTML = ''; $('raw').textContent = ''; evCount = 0; $('count').textContent = '0';
+};
+
+function stopStream() {
+  if (es) { es.close(); es = null; }
+  if (abort) { abort.abort(); abort = null; }
+}
+
+function buildPayload() {
+  if (!$('sid').value) $('sid').value = uuid();
+  if (!$('marker').value) $('marker').value = 'dbg_' + $('sid').value.slice(0, 8);
+  return {
+    prompt: $('prompt').value,
+    session_id: $('sid').value,
+    marker: $('marker').value,
+    attachments: attachments,
+  };
+}
+
+// ---- 模式 A：POST 直接返回 SSE，用 fetch + ReadableStream 手动解析 ----
+async function startPostSse(payload) {
+  abort = new AbortController();
+  const resp = await fetch(B() + '/api/page/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+    body: JSON.stringify(payload),
+    signal: abort.signal,
+  });
+  raw(`# POST /api/page/generate -> ${resp.status} ${resp.headers.get('content-type')}\n`);
+  if (!resp.ok) {
+    logEvent('error', await resp.text());
+    setStatus('error', 'err');
+    return;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    raw(chunk);
+    buf += chunk;
+    let idx;
+    while ((idx = buf.search(/\r?\n\r?\n/)) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + buf.match(/\r?\n\r?\n/)[0].length);
+      dispatchFrame(frame);
+    }
+  }
+  setStatus('stream closed');
+}
+
+function dispatchFrame(frame) {
+  let event = 'message';
+  const dataLines = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;         // 注释行 / ping
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (!dataLines.length && event === 'message') return;
+  logEvent(event, safeJson(dataLines.join('\n')) ?? dataLines.join('\n'));
+}
+
+// ---- 模式 B：先拿 session_id，再用 EventSource 订阅 GET 流 ----
+const KNOWN_EVENTS = ['receive', 'analyze', 'design', 'code', 'fix', 'verify', 'host', 'done', 'cancelled', 'error'];
+
+function openEventSource(sessionId) {
+  const url = `${B()}/api/page/generate/${sessionId}/stream`;
+  raw(`# EventSource ${url}\n`);
+  es = new EventSource(url);
+  es.onopen = () => setStatus('streaming', 'run');
+  es.onmessage = (e) => { raw(`data: ${e.data}\n`); logEvent('message', safeJson(e.data) ?? e.data); };
+  for (const name of KNOWN_EVENTS) {
+    es.addEventListener(name, (e) => {
+      if (name === 'error' && !e.data) return;           // EventSource 自身的连接错误
+      raw(`event: ${name}\ndata: ${e.data}\n\n`);
+      logEvent(name, safeJson(e.data) ?? e.data);
+      if (name === 'done' || name === 'cancelled') { es.close(); es = null; }
+    });
+  }
+  es.addEventListener('error', () => {
+    if (es && es.readyState === EventSource.CLOSED) { setStatus('stream closed'); es = null; }
+  });
+}
+
+$('btnStart').onclick = async () => {
+  stopStream();
+  const payload = buildPayload();
+  setStatus('starting', 'run');
+  raw(`\n# ===== start session=${payload.session_id} marker=${payload.marker} =====\n`);
+  try {
+    if ($('mode').value === 'post') {
+      setStatus('streaming', 'run');
+      await startPostSse(payload);
+    } else {
+      const resp = await fetch(B() + '/api/v1/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      const body = await resp.json();
+      raw(`# POST /api/v1/generate -> ${resp.status} ${JSON.stringify(body)}\n`);
+      if (!resp.ok) { logEvent('error', body); setStatus('error', 'err'); return; }
+      $('sid').value = body.session_id;
+      openEventSource(body.session_id);
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') { logEvent('error', String(err)); setStatus('error', 'err'); }
+  }
+};
+
+$('btnReconnect').onclick = () => {
+  const sid = $('sid').value;
+  if (!sid) { alert('没有 session_id'); return; }
+  stopStream();
+  openEventSource(sid);
+};
+
+$('btnCancel').onclick = async () => {
+  const sid = $('sid').value;
+  if (!sid) { alert('没有 session_id'); return; }
+  const resp = await fetch(`${B()}/api/page/generate/${sid}/cancel`, { method: 'POST' });
+  raw(`# cancel -> ${resp.status} ${await resp.text()}\n`);
+  setStatus('cancelling', 'err');
+};
+
+renderFiles();
+
+
+
+
+</script>
+</body>
+</html>
