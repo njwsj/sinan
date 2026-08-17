@@ -3,6 +3,7 @@ import json
 from sinan.agents.llm import LLMClient
 from sinan.agents.state import PageGenState
 from sinan.services.generation_event_bus import event_bus
+from sinan.models import events
 
 
 def _build_att_context(attachments: list) -> str:
@@ -50,6 +51,8 @@ class CoderAgent:
 
     async def run(self, state: PageGenState) -> dict:
         session_id = state.get("session_id", "")
+        marker = state.get("marker")
+        round_num = state.get("iteration", 0)
         user_content = (
             f"用户需求：\n{state['prompt']}\n\n"
             f"需求分析：\n{state['requirements']}\n\n"
@@ -65,12 +68,28 @@ class CoderAgent:
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
-        html_chunks = []
+        html_chunks: list[str] = []
+        accumulated_len = 0
+
+        if session_id:
+            await event_bus.publish(
+                session_id, events.CODE_START,
+                events.code_start_data(round_num=round_num), marker=marker,
+            )
         async for token in self.llm.astream(messages, temperature=0.3):
             html_chunks.append(token)
+            accumulated_len += len(token)
             if session_id:
-                await event_bus.publish(session_id, "code_delta", {"delta": token})
-
+                await event_bus.publish(
+                    session_id, events.CODE_DELTA,
+                    events.code_delta_data(token, accumulated_len), marker=marker,
+                )
+        if session_id:
+            await event_bus.publish(
+                session_id, events.CODE_STREAM_END,
+                events.code_stream_end_data(accumulated_len, round_num=round_num),
+                marker=marker,
+            )
         html = self._strip_markdown("".join(html_chunks))
         return {"html": html}
 

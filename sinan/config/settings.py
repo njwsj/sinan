@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
     redis_db: int = 0
+    redis_max_connections: int = 64
+
+
+    # --- SSE / 事件总线 ---
+    event_bus_backend: str = "redis"      # redis / memory（memory 仅本地开发）
+    sse_max_events: int = 1000            # 每个 session 保留的事件条数上限
+    sse_terminal_ttl_seconds: int = 120   # 终止事件后 key 的存活时间
+    sse_poll_seconds: float = 1.0         # subscribe 轮询间隔
+    sse_ping_seconds: int = 30            # SSE 心跳间隔
 
     # --- LLM ---
     llm_api_key: str = ""

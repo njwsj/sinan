@@ -92,4 +92,5 @@
 | 预览路径 `/api/page/preview/{marker}`、`/v{version}` | 缺失 | **待实施**（现仅有 `/api/v1/page/{marker}`） | 添加兼容路由后访问确认 HTML 响应 |
 | 认证 | 无 | 无（Step 3 加） | 仍待解决 |
 | Session/Job/确认/取消/恢复 API | 缺失 | **待实施**（session/pages/upload 桩文件尚未创建） | 待 Step 1 建桩、Step 4-10 实现 |
-| `POST /api/page/generate` SSE 使用内存 Queue | — | 是（与参考项目 Redis replay 仍不同） | 待 Step 5 替换 |
+| `POST /api/page/generate` SSE 使用内存 Queue | — | 已替换为 Redis List 持久化事件流（Step 5），`Last-Event-ID`/`cursor` 断线续传，`ping=30` | 需 curl 断线重连确认不丢不重 |
+| SSE 事件 ID 与回放 | 无 ID、无回放 | 已实现（`models/events.py`、`services/generation_event_bus.py`） | 待 Step 15 双项目 SSE 原文对照 |

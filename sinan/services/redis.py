@@ -6,11 +6,19 @@ from sinan.config.settings import settings
 _redis: aioredis.Redis | None = None
 
 
-def get_redis() -> aioredis.Redis:
+def create_redis() -> aioredis.Redis:
+    """创建并缓存全局连接池。应用启动时调用一次，重复调用幂等。"""
     global _redis
     if _redis is None:
-        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        _redis = aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=settings.redis_max_connections,
+        )
     return _redis
+
+def get_redis() -> aioredis.Redis:
+    return create_redis()
 
 
 async def close_redis() -> None:

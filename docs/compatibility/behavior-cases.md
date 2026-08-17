@@ -9,8 +9,8 @@
 | 3 | Prompt 过长 | 有约束待测 | 无声明 | 实际边界 |
 | 4 | 普通聊天输入 | 有，mode/chat | 缺失 | 路由与事件 |
 | 5 | 页面生成失败 | 有，SSE error | 部分 | error payload/状态 |
-| 6 | 生成中客户端断线 | 有 | 部分 | Redis 保留事件 |
-| 7 | 完成后重新连接 | 有 | 缺失 | Last-Event-ID/终态回放 |
+| 6 | 生成中客户端断线 | 有 | 部分（Step 5） | 事件已落 Redis List，重连带 `Last-Event-ID`/`cursor` 从断点补发；待黑盒验证不丢不重 |
+| 7 | 完成后重新连接 | 有 | 部分（Step 5） | 终止事件后 key TTL 120s，晚到客户端仍可收到 `completed`；TTL 过期后的行为待确认 |
 | 8 | 取消生成 | 有 abort | 部分（Step 4） | Redis `cancel_registry` 支持运行中节点边界打断+cancelled 事件；打断粒度/事件顺序待黑盒验证 |
 | 9 | 服务重启恢复 | 有 Job Supervisor | 部分（Step 4） | lease/retry/supervisor 已具备，待黑盒验证 |
 | 10 | 复用已有 Session | 有 | 部分（Step 4） | `create_or_get_job` 按 session 复用活动 Job，session_id 语义待验证 |

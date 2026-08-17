@@ -1,7 +1,7 @@
 # sinan 与原项目 page 百分百对齐：逐 Step 实施方案
 
-本文面向项目 `/Users/zhanghj/Documents/learn/sinan`，以原项目
-`/Users/zhanghj/Documents/baidu/project/baidu/gcloud/page` 为行为基准。
+本文面向项目 `/Users/zhanghongjia/Documents/work/sinan`，以原项目
+`/Users/zhanghongjia/Documents/project/baidu/gcloud/page` 为行为基准。
 
 目标不是让两个项目的文件名完全相同，而是让两边在相同输入下具备一致的：
 
@@ -33,7 +33,7 @@ Prompt
   → Verifier
   → Fixer
   → PageVersion
-  → 内存 SSE
+  → Redis 持久化 SSE（Step 5 起，可回放）
 ```
 
 主要文件：
@@ -893,16 +893,22 @@ close(session_id)
 trim(session_id)
 ```
 
-内部实现：
+内部实现（按参考项目实际做法，不是 Redis Stream）：
 
 ```text
-Redis Stream
-  → stream key: page:generation:events:{session_id}
-  → message id 作为 event_id
-  → data 存 JSON
+Redis List
+  → 事件 key：   sinan:generation:events:{session_id}
+  → 序列号 key： sinan:generation:events:seq:{session_id}（INCR 生成）
+  → event_id 为十进制整数字符串，可直接比较大小
+  → 记录内容为 JSON：{"seq": N, "event": {GenerationEvent 全字段}}
+  → LTRIM 保留最新 1000 条；终止事件后给 key 打 120s TTL
+  → subscribe 用 1s 轮询 LRANGE，不用 pub/sub
 ```
 
-如果 Redis 不可用，开发环境可以使用 `InMemoryEventBus`，但接口必须一致。
+> 参考项目 `page/services/generation_event_bus.py:12-17,146-185` 用的是 List + INCR，不是 Stream。
+> 用 Stream 会让 `event_id` 变成 `1712-0` 形式的复合 ID，客户端无法按大小比较游标，与参考行为不兼容。
+
+如果 Redis 不可用，开发环境可以使用 `InMemoryEventBus`（`EVENT_BUS_BACKEND=memory`），但接口必须一致。
 
 ## 5.3 新增 `sinan/services/redis.py`
 
@@ -983,6 +989,37 @@ cancelled
 4. 两个客户端同时订阅，互不消费对方事件；
 5. 服务重启后事件仍可回放；
 6. completed/error/cancelled 只终止当前 SSE，不影响历史查询。
+
+## 实施结论（2026-08-17，代码已落地）
+
+改动文件：
+
+```text
+sinan/models/events.py              新增：GenerationEvent、事件名常量、TERMINAL_EVENTS、data 构造器
+sinan/services/generation_event_bus.py  重写：RedisEventBus + InMemoryEventBus，publish/replay/subscribe/get_last_event_id/close/trim
+sinan/services/redis.py             新增 create_redis()，get_redis() 委托它保证单一入口
+sinan/config/settings.py            新增 SSE 分区与 redis_max_connections
+sinan/api/routes/generate.py        Last-Event-ID/cursor → replay → subscribe → 终止事件关闭；新增 session_init
+sinan/services/generation_runner.py 事件名换为公共契约（step/fix_applied/verify_result/completed/error/cancelled）
+sinan/agents/coder.py               新增 code_start / code_stream_end，code_delta 带 accumulated_len
+sinan/api/app.py                    启动时 create_redis()
+```
+
+关键设计决定：
+
+- 用 Redis List + INCR 而非 Stream，理由见 5.2 的说明；
+- 删除 `publish_done` 与 `_SENTINEL`：终止语义改由事件名承载。哨兵无法持久化，保留它会导致"重连后 SSE 永不结束"；
+- `publish` 保留 `(session_id, event_type, data)` 三参数形态，`job_id`/`marker` 走关键字，避免全部调用点改签名；
+- 顺带修掉一处既有 bug：`verify_result` 原先嵌在 `iteration > 0` 分支内，零修复时客户端收不到任何验证结果。
+
+遗留项（记录在 `docs/compatibility/event-matrix.md` 的"未对齐"）：
+
+- 取消事件名与参考不同（参考用 `error` 承载取消）；
+- `quality_score` 恒为 `0.0`，待 Step 7 扩展 gates/verifier；
+- `gate_passed`、`code_snapshot`、`verify_start`、`fix_start`、`awaiting_confirmation`、`chat`、`skill_*`、`knowledge_source` 只固化了协议常量，发布点分别属于 Step 7/8/12；
+- 上述 6 条验收标准尚未执行黑盒验证，需在 Step 15 与参考项目做 SSE 原文对照。
+
+运行前置：事件总线默认硬依赖 Redis。本地无 Redis 时必须设 `EVENT_BUS_BACKEND=memory`，否则第一条 `session_init` 就会连接失败。
 
 ---
 

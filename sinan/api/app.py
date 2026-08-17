@@ -32,6 +32,8 @@ async def lifespan(app: FastAPI):
     # 服务器启动时：初始化日志和数据库
     setup_logging(settings.debug)
     await init_db()
+    from sinan.services.redis import create_redis
+    create_redis()
     from sinan.services.generation_supervisor import start_supervisor, stop_supervisor
     await start_supervisor()
     yield
