@@ -18,6 +18,8 @@ import socket
 from contextlib import suppress
 from sinan.services.generation_job_store import generation_job_store, CANCELLED
 from sinan.services import cancel_registry
+from sinan.models import events
+
 _OWNER = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
 _LEASE_SECONDS = 90
 _HEARTBEAT_SECONDS = 20
@@ -97,8 +99,10 @@ class GenerationRunner:
                 if await cancel_registry.is_cancelled_async(session_id):
                     await generation_job_store.request_cancel(job_id=job.job_id)
                     await session_store.update(session_id, status=SessionStatus.FAILED)  # Step 6 可换成 CANCELLED 枚举
-                    await event_bus.publish(session_id, "cancelled", {"message": "已取消生成"})
-                    await event_bus.publish_done(session_id)
+                    await event_bus.publish(
+                        session_id, events.CANCELLED, events.cancelled_data(),
+                        job_id=job.job_id, marker=resolved_marker,
+                    )
                     return  # 正常返回，run_job 复查到 cancelled 不置 completed
                 kind = event["event"]
                 name = event.get("name", "")
@@ -107,7 +111,11 @@ class GenerationRunner:
                 if kind == "on_chain_start":
                     node_name = event.get("metadata", {}).get("langgraph_node", "")
                     if node_name in step_labels:
-                        await event_bus.publish(session_id, node_name, {"message": step_labels[node_name]})
+                        await event_bus.publish(
+                            session_id, events.STEP,
+                            events.step_data(node_name, step_labels[node_name], node_name),
+                            job_id=job.job_id, marker=resolved_marker,
+                        )
                         await self._write_step(session_id, node_name, f"开始{node_name}")
 
                 # 图执行结束后拿到最终 state
@@ -115,23 +123,34 @@ class GenerationRunner:
                     final_state = event["data"].get("output")
 
             # 如果经历了修复，推送修复事件
-            if final_state.get("iteration", 0) > 0:
+            iteration = final_state.get("iteration", 0)
+            if iteration > 0:
                 await event_bus.publish(
-                    session_id,
-                    "fix",
-                    {"message": f"经过 {final_state['iteration']} 轮修复"},
+                    session_id, events.FIX_APPLIED,
+                    events.fix_applied_data(iteration, "auto", iteration),
+                    job_id=job.job_id, marker=resolved_marker,
                 )
                 await self._write_step(
                     session_id, "fix",
                     f"修复完成，共 {final_state['iteration']} 轮",
                 )
 
-                # 推送验证结果
-                await self._write_step(session_id, "verify", final_state.get("verify_message", ""))
-                await event_bus.publish(
-                    session_id, "verify",
-                    {"message": final_state.get("verify_message", "校验完成")},
-                )
+            # 验证结果无论是否修复都要推送
+            verify_message = final_state.get("verify_message", "校验完成")
+            await self._write_step(session_id, "verify", verify_message)
+            await event_bus.publish(
+                session_id, events.VERIFY_RESULT,
+                {
+                    **events.verify_result_data(
+                        passed=bool(final_state.get("verified")),
+                        quality_score=float(final_state.get("quality_score") or 0.0),
+                        issues=final_state.get("issues") or [],
+                        round_num=iteration,
+                    ),
+                    "message": verify_message,
+                },
+                job_id=job.job_id, marker=resolved_marker,
+            )
 
             if not final_state.get("verified"):
                 raise ValueError(
@@ -147,8 +166,10 @@ class GenerationRunner:
             让终态统一由 run_job 决定。异常直接抛出交给 run_job 接住。
             """
             logger.exception("generation failed for session %s", session_id)
-            await event_bus.publish(session_id, "error", {"message": f"生成失败：{e}"})
-            await event_bus.publish_done(session_id)
+            await event_bus.publish(
+                session_id, events.ERROR, events.error_data(f"生成失败：{e}"),
+                job_id=job.job_id, marker=resolved_marker,
+            )
             return
 
         # 托管：写 page_version 表，更新 session
@@ -172,13 +193,15 @@ class GenerationRunner:
         )
 
         # 推送托管完成事件，再关闭 SSE 流
-        await event_bus.publish(session_id, "done", {
-            "message": "页面生成完成",
-            "preview_url": preview_url,
-            "marker": marker,
-            "version": version,
-        })
-        await event_bus.publish_done(session_id)
+        await event_bus.publish(
+            session_id, events.COMPLETED,
+            events.completed_data(
+                version=version,
+                preview_url=preview_url,
+                quality_score=float(final_state.get("quality_score") or 0.0),
+            ),
+            job_id=job.job_id, marker=marker,
+        )
 
     async def _write_step(self, session_id: str, step: str, message: str) -> None:
         """把步骤执行记录写入 gen_session_step 表"""

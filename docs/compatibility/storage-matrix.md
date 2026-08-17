@@ -9,7 +9,7 @@
 | PageVersion | 参考版本快照，BOS 存储 | `page_version`，HTML/source_code 直接入库 | 存储介质和发布元数据不同 |
 | Artifact | 参考 `GenerationArtifact`，支持类型和内容读取 | 无 Artifact 表 | 缺失 |
 | 上传附件 | 参考上传服务、对象存储/数据元信息 | 本地 JSON，runner 从 `attachment_storage_path` hydrate | 仅覆盖部分 Excel/数据路径 |
-| 事件 | Redis stream/list，带 seq | 内存 `asyncio.Queue` | 无持久化/回放 |
+| 事件 | Redis List，带 seq | Redis List + INCR seq（Step 5 已实现）：`sinan:generation:events:{sid}`，上限 1000 条，终止事件后 TTL 120s；`EVENT_BUS_BACKEND=memory` 仅本地开发 | 持久化与回放已对齐 |
 | Runtime checkpoint | LangGraph/runtime checkpoint | 当前由 graph 配置 thread_id，但未形成对外恢复协议 | 待验证 |
 
 当前页面保存路径：`sinan/services/page_store.py:16-31`；完成时由 runner 更新 Session 的 `marker/version/preview_url`（`generation_runner.py:129-147`）。
