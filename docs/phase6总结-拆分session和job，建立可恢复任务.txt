@@ -1,0 +1,97 @@
+新增：
+	1.生成任务表（generation_job）
+
+	2.取消生成服务（cancal_registry）
+		使用asyncio.Event作为一个开关
+		cancel_async(session_id: str) 打开开关 代表要停止该session_id的生成
+		clear_async(session_id: str) 关闭开关 每次生成流开始前用
+		is_cancelled_async(session_id: str) 查询该session_id是否被取消，在graph执行的时候使用，遍历每一步，
+			如果发现被取消了 
+			        await generation_job_store.request_cancel(job_id=job.job_id) 更新job为取消，这种不会被定时扫描执行
+                    await session_store.update(session_id, status=SessionStatus.FAILED)  更新session状态
+                    await event_bus.publish(session_id, "cancelled", {"message": "已取消生成"}) publish事件
+                    await event_bus.publish_done(session_id) publish done
+                    return  # 正常返回，run_job 复查到 cancelled 不置 completed
+
+	3.生成任务存储服务（generation_job_store）
+		定义job状态：pending-未开始，running-开始，completed-完成，failed-失败，canceled-取消，终态（完成，失败，取消），活跃状态（running，pending）
+		_new_job：新建一个即将入库的job类
+		create_or_get_job：创建或者返回一个job，当job存在且状态为活跃状态 直接返回，或job存在传参数为重连（判断入参有没有session_id字段）也直接返回。在generate接口中调用
+		get_job：按照jobId查出一个job 在worker 跑完 pipeline 之后 可以调用查看job的最新状态，看看是不是cancel
+		get_job_by_session：根据sessionId查出最新的job（一个session中可能会存在多个job：同一个会话里，用户第一次生成、取消了，然后又点了"重新生成"。每次生成请求都会创建一个新job，但它们属于同一个session。）
+		claim_job：原子抢占job，仅当 Job 活动、未达上限、且租约空闲/过期/属于自己时才能领取 在runner的run_job中调用
+		heartbeat：续租：只有仍持租约的 owner 能续。返回 False 说明租约被抢走，本地应停止执行。在runner中原子抢占到job后 紧接着就是进行续租操作
+		list_reclaimable_jobs：返回可恢复 Job列表：pending，或 running 但租约空/过期，且未达上限。
+		_mark_terminal：置终态，仅当自己持租约时生效，并清空租约。
+		mark_completed
+		mark_failed
+		request_cancel：外部取消：把匹配的活动 Job 置 cancelled 并清租约。运行中 worker 在 finalize 前复查状态不会再置 completed。
+			场景还原：
+
+				worker 正在跑生成任务（status = running）
+				用户点了取消，request_cancel 把数据库里的 status 改成了 cancelled
+				worker 跑完了，准备把结果写回数据库，把 status 改成 completed
+				如果 worker 不做任何检查，第3步会把 cancelled 覆盖成 completed，取消就白取消了。
+
+				所以 worker 在 finalize（写最终结果）之前，会先查一次数据库，看当前 status 是不是还是 running：
+				/Users/zhanghongjia/Documents/work/sinan/sinan/services/generation_runner.py 第 229-232 行
+				worker 跑完 pipeline 之后，先查一次最新状态，如果发现是 cancelled 就直接 return，不再调 mark_completed
+
+				如果是 cancelled → 不写 completed，放弃
+				如果还是 running → 正常写 completed
+		count_recent_active_jobs：关机时统计近期仍活跃的 Job，用于优雅等待。（暂未使用）
+
+
+	4.生成任务监控服务（generation_supervisor）
+		ensure_job_running:确保当前进程为指定的jiobId启动一个task
+		supervisor_loop：主循环 15s扫描可恢复的job（调用generation_job_store.list_reclaimable_jobs()）遍历这些job，对每个job调用ensure_job_running
+		start_supervisor：启动 supervisor 后台循环（幂等）。
+		stop_supervisor：优雅停止 supervisor 及所有正在执行的 Job task。
+	5.redis
+
+修改：
+	1.generate接口：
+		对应情况/场景：
+			情况1：reconnect=True + 有活动 Job
+			用户刷新页面/网络断了重连，后端正在跑的任务还没结束
+			直接复用，不重复创建任务
+
+			情况2：reconnect=True + Job 是终态
+			用户刷新页面，上次生成已经完成或被取消
+			复用最近的 Job，前端可以拿到上次的结果展示
+
+			情况3：reconnect=True + 没有任何 Job
+			用户带着一个旧 session_id 过来，但数据库里查不到记录（比如数据清理过）
+			兜底新建一个
+
+			情况4：reconnect=False + 没有活动 Job
+			用户第一次发起生成请求，没有历史 session
+			正常新建任务
+
+	2.generation_runner
+		添加run_job方法：领取并执行一个 Job：抢租约 → 心跳续租 → 执行流水线（_execute_generation_pipeline） → finalize。
+		_execute_generation_pipeline方法：
+			cancel_registry.clear_async(session_id)
+			graph.astream
+			if await cancel_registry.is_cancelled_async(session_id) 运行中取消检测（节点边界，跨实例）
+
+
+generate接口完整流程
+	_create_or_reuse_generation(req)
+		获取session
+		获取job
+			若job是被创建的进入ensure_job_running
+				调用generation_runner.run_job(job_id)
+					1. generation_job_store.claim_job(job_id, _OWNER, _LEASE_SECONDS)抢租约
+					2.heartbeat_task = asyncio.create_task(self._heartbeat_loop(job_id))心跳续租
+					3._execute_generation_pipeline 执行pipline
+						a.await cancel_registry.clear_async(session_id)关闭取消开关
+						b.self.graph.astream 开始graph
+						c.if await cancel_registry.is_cancelled_async(session_id) 循环遍历监听是否取消
+					4.最终保证心跳任务被取消，避免僵尸任务heartbeat_task.cancel()
+			否则直接返回
+
+
+
+
+
