@@ -128,7 +128,12 @@ class GenerationJobStore:
             return bool(result.rowcount)
 
     async def list_reclaimable_jobs(self, limit: int = 20) -> list[GenerationJob]:
-        """可恢复 Job：pending，或 running 但租约空/过期，且未达上限。"""
+        """可恢复 Job：pending，或 running 但租约空/过期，且未达上限。
+        因为第一个 AND 项已经把 status 限定在 pending 和 running 两种，所以 OR 组可以按 status 分情况化简：
+
+        如果这行是 pending：OR 组第一项 status='pending' 直接为真，整组为真，租约那两项根本不用看。所以结论是"所有 pending 都算候选"。
+        如果这行是 running：OR 组第一项为假，只能靠 lease空 或 lease过期 来满足。所以结论是"running 的行，必须租约空或过期才算候选"。
+        """
         now = datetime.now()
         async with AsyncSessionLocal() as db:
             result = await db.execute(
