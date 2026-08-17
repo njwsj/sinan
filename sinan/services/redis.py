@@ -14,6 +14,7 @@ def create_redis() -> aioredis.Redis:
             settings.redis_url,
             decode_responses=True,
             max_connections=settings.redis_max_connections,
+            protocol=2,  # 禁用 HELLO 握手，兼容不支持 RESP3 的 Redis/Valkey 版本
         )
     return _redis
 
