@@ -85,6 +85,7 @@ class GenerationJobStore:
         lease_until = now + timedelta(seconds=lease_seconds)
         async with AsyncSessionLocal() as db:
             result = await db.execute(
+                # 前三个条件必须全部成立（是这个 Job、还活着、还没超重试上限），并且第四组里至少满足一个（租约现在是可以拿的）
                 update(GenerationJob)
                 .where(
                     GenerationJob.job_id == job_id,
