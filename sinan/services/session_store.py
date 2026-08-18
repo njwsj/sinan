@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import GenSession
 from sinan.models.enums import SessionStatus
+from sinan.models.enums import PipelineState, SessionStatus
 
 
 class SessionStore:
@@ -14,6 +15,7 @@ class SessionStore:
             *,
             session_id: str | None = None,
             marker: str | None = None,
+            attachments: list | None = None,
     ) -> GenSession:
         """创建新 session，写入数据库，返回 ORM 对象"""
         resolved_session_id = session_id or uuid.uuid4().hex
@@ -22,7 +24,10 @@ class SessionStore:
             user_id=user_id,
             prompt=prompt,
             marker=marker,
-            status=SessionStatus.PENDING,
+            title=(prompt or "")[:64],
+            attachments=attachments or [],
+            status=SessionStatus.ACTIVE.value,
+            pipeline_state=PipelineState.INIT.value,
         )
         async with AsyncSessionLocal() as db:
             db.add(session)
@@ -37,6 +42,7 @@ class SessionStore:
         user_id: str,
         prompt: str,
         marker: str,
+        attachments: list | None = None,
     ) -> tuple[GenSession, bool]:
         """返回已有 Session，或者创建新 Session。
         现在的"先查后建"不是并发安全的：如果两个请求几乎同时用同一个 session_id 打进来，
@@ -55,6 +61,7 @@ class SessionStore:
             prompt=prompt,
             session_id=session_id,
             marker=marker,
+            attachments=attachments,
         )
         return session, True
 

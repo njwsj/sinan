@@ -84,14 +84,17 @@ async def _create_or_reuse_generation(
     后续用相同 session_id 再 POST（比如客户端断线后重连）：
     created=False → 不重复起任务，只是重新订阅这个 session 的 SSE 事件流。
     """
+    # 创建或获取 Session
     await session_store.create_or_get(
         session_id=session_id,
         user_id=_TRANSITIONAL_USER_ID,
         prompt=req.prompt,
         marker=marker,
+        attachments=req.attachments,
     )
 
     payload = req.model_dump(mode="json")
+    # 创建或获取 Job
     result = await generation_job_store.create_or_get_job(
         session_id=session_id, marker=marker, user_id=_TRANSITIONAL_USER_ID,
         payload=payload, reconnect=bool(req.session_id),

@@ -44,7 +44,8 @@ async def get_audit(session_id: str):
 
     return {
         "session_id": session_id,
-        "status": session.status.value if session.status else None,
+        "status": session.status,
+        "pipeline_state": session.pipeline_state,
         "prompt": session.prompt,
         "total_steps": len(steps),
         "audit_trail": audit_trail,

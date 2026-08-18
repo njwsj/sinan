@@ -1,0 +1,60 @@
+Phase8 之前的模型有什么毛病
+之前那 4 张表是"能跑通就行"的最小实现。跑单次生成没问题，但有四个结构性缺陷，它们都不是 bug，而是表达能力不足。
+
+页面没有身份
+page_version 同时充当页面主表。于是"这个 marker 是谁的、现在是什么状态、最新是第几版"这些问题，只能通过聚合版本行来回答：
+
+想知道最新版本号，得扫这个 marker 的所有版本
+SELECT MAX(version) FROM page_version WHERE marker = 'page_abc';
+更麻烦的是发布状态。旧表每一行版本都有自己的 status，那么"页面发布了吗"就是个歧义问题 —— 可能 v1 是 published、v2 是 draft，也可能 v1 和 v3 都是 published。数据库允许这种自相矛盾的状态存在，代码就得靠约定去回避，而约定是会被忘掉的。
+
+owner 也一样挂在版本上。同一个页面的 v1 和 v2 理论上可以是不同 owner，那这个页面到底属于谁？没有答案。这直接卡住 Step 3 的资源鉴权 —— 鉴权的前提是"资源归属"有唯一答案。
+
+状态语义混在一列
+旧 SessionStatus 是 pending/running/completed/failed/awaiting_input，这五个值其实在描述三件不同的事：
+
+pending / running —— 任务在排队/在执行
+completed / failed —— 会话结束了
+awaiting_input —— 流程卡在某个环节
+Step 4 拆出 generation_job 之后，"任务在不在跑"已经由 job.status 表达了。session.status 再存一份 running，就出现了两个真相来源，而且它们会打架：Job 被 cancelled 了，Session 还写着 running；Job 重试到第 2 次，Session 那边完全看不出来。
+
+Step 6 把这三件事拆到三个正交的维度上：
+
+
+gen_session.status         会话生命周期    active / paused / completed / failed / archived
+gen_session.pipeline_state 流程走到哪      init … analysis … validation … delivered / failed
+generation_job.status      任务执行状态    pending / running / waiting / completed / failed / cancelled
+page.status                产物状态        draft / preview / published / archived
+拆开之后才能表达真实世界里的组合状态。比如"会话还活着（active）、当前流程在等用户确认（user_confirm）、上一个任务已完成（completed）、页面有 v2 但还没发布（preview）"—— 这在旧模型里是无法表示的，单列 status 只能选一个值。
+
+ENUM 列锁死扩展
+旧表的 status 是 MySQL 的 ENUM 类型。加一个状态值就得 ALTER TABLE，而 Step 7/8 明确还要加 waiting、user_confirm、preview 等。改成 String(32) 之后，加状态只改 Python 枚举，数据库不动。这也是参考项目的做法 —— 它九张表的 status 全是 String(32)。
+
+中间产物无处安放
+analysis 的需求文档、design 的设计方案、verification 的问题清单，之前只存在于两个地方：进程内存里的 LangGraph state，以及 SSE 事件流。前者进程一重启就没了，后者 Redis 的 TTL 是 120 秒。
+
+这意味着一个页面生成完之后，你无法回答"它为什么长这样"。Step 8 的多轮修改会直接撞上这个问题：用户说"把上面那个表格改成柱状图"，系统需要知道上一轮的需求文档和设计方案是什么，才能做增量修改而不是重新生成一遍。generation_artifact 就是为这个存在的。
+
+这一步换来的是什么
+本质上是给后续 Step 铺地基。Step 6 自己不产生任何用户可见的新功能，它交付的是"后面几步不用再动表结构"这个前提：
+
+Step 7（Harness/门禁） 要落 gate_reports、verification_score、harness_score、repair_rounds，还要把 analysis/design 快照存进 artifact —— 列和表已备好
+Step 8（用户确认 + 多轮迭代） 要 paused/waiting 状态、user_confirm 阶段、requirement_doc、messages（多轮对话上下文）—— 已备好
+Step 9/10（对象存储 + 发布托管） 要 page.published_version/published_to、page_version.bos_path/entry_file/file_list/content_hash —— 列位已打出来，接 BOS 时只改写入逻辑，不再改表
+Step 11/12（模板 / Skill） —— 表已建
+Step 3/15（权限与黑盒对齐） —— page.owner 是资源鉴权的挂载点
+顺序上现在做是对的：模型是所有代码的地基，越往后改越贵（Step 10 的时候要动表，意味着 Step 7/8/9 写的代码全要跟着改）。而且 Step 5 已经把 SSE 事件协议定死了，事件里携带的 version/marker/quality_score 需要有对应的落库位置，否则事件是"说了但没记"。
+
+这一步刻意没有解决的事
+说清楚边界能避免误判 Step 6 的完成度：
+
+不解决行为对齐。没有新接口、没有新行为，纯结构改动。你现在跑一遍生成，从外部看和 Step 5 几乎没区别 —— 这是预期结果，不是没生效。
+不解决存储介质。HTML 还在 html_content 列里，bos_path 是空的，那是 Step 9。
+不解决权限。page.owner 有值了，但没有任何地方拿它做过滤，auth_mode 还是 none。
+不解决迁移能力。你选的是换库方案，所以后续再改模型仍然要重建库。等有真实数据要保时必须补 Alembic —— 这条已经写进矩阵的遗留项。
+从学习角度值得留意的几个设计取舍
+主表 + 快照表的职责分离。 page 存"当前是什么"（可变），page_version 存"曾经是什么"（不可变）。page.current_version 是一个冗余字段 —— 它的值完全可以从 page_version 聚合出来 —— 但它是有意的读优化：查最新版本从"扫 N 行求 MAX"变成"读一个字段"。代价是写入时必须保证两者一致，所以 page_store.save() 把 upsert Page 和 insert Version 放在同一个事务里。这是典型的"用写入端的复杂度换读取端的简单和性能"。
+
+单一真相来源。 你刚修的 JobStatus 收敛问题是同一个原则的另一个体现：同一个事实只在一处定义。旧模型里"任务在跑"这个事实同时存在于 session.status 和 job.status，跟常量同时存在于枚举和模块变量，是完全同构的问题。
+
+先建列位、后接实现。 bos_path、allowed_datasources、skill_definition 整张表都是空的。这看起来像过度设计，但在"逐 Step 对齐参考项目"这个特定场景下是合理的：一次性把目标结构定下来，后续每步只改代码不改表，避免每个 Step 都要迁移一次数据库。如果是从零做产品，我不会这么建 —— 会等到真正需要那一列时再加。

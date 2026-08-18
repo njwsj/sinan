@@ -7,7 +7,7 @@ from pathlib import Path
 from sinan.agents.llm import LLMClient
 from sinan.agents.graph import build_graph
 from sinan.models.database import AsyncSessionLocal
-from sinan.models.tables import GenSessionStep, PageVersion
+from sinan.models.tables import GenSessionStep
 from sinan.models.enums import SessionStatus, PageStatus
 from sinan.services.session_store import session_store
 from sinan.services.generation_event_bus import event_bus
@@ -19,6 +19,7 @@ from contextlib import suppress
 from sinan.services.generation_job_store import generation_job_store, CANCELLED
 from sinan.services import cancel_registry
 from sinan.models import events
+from sinan.models.enums import PipelineState
 
 _OWNER = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
 _LEASE_SECONDS = 90
@@ -48,7 +49,11 @@ class GenerationRunner:
         attachments = payload.get("attachments") or []
 
         resolved_marker = marker or f"page_{session_id[:8]}"
-        await session_store.update(session_id, status=SessionStatus.RUNNING)
+        await session_store.update(
+            session_id,
+            status=SessionStatus.ACTIVE.value,
+            pipeline_state=PipelineState.ANALYSIS.value,
+        )
         await cancel_registry.clear_async(session_id)
 
         try:
@@ -98,7 +103,14 @@ class GenerationRunner:
                 # —— 运行中取消检测（节点边界，跨实例） ——
                 if await cancel_registry.is_cancelled_async(session_id):
                     await generation_job_store.request_cancel(job_id=job.job_id)
-                    await session_store.update(session_id, status=SessionStatus.FAILED)  # Step 6 可换成 CANCELLED 枚举
+                    # 参考项目没有 cancelled 会话态（取消由 error 事件承载），
+                    # 这里落 failed + error_message，作为未对齐项记录在 state-matrix。
+                    await session_store.update(
+                        session_id,
+                        status=SessionStatus.FAILED.value,
+                        pipeline_state=PipelineState.FAILED.value,
+                        error_message="cancelled by user",
+                    )
                     await event_bus.publish(
                         session_id, events.CANCELLED, events.cancelled_data(),
                         job_id=job.job_id, marker=resolved_marker,
@@ -177,21 +189,29 @@ class GenerationRunner:
         # 托管：写 page_version 表，更新 session
         marker = resolved_marker
         version = await page_store.next_version(marker)
+        quality_score = float(final_state.get("quality_score") or 0.0)
         await page_store.save(
             marker=marker,
             version=version,
             html=html,
             created_by=session.user_id if session else "system",
+            session_id=session_id,
+            title=(session.prompt if session else "")[:128],
+            harness_score=quality_score,
+            repair_rounds=iteration,
         )
         # 拼预览 URL（本地开发用 /page/{marker}，生产替换域名）
         preview_url = f"/api/page/preview/{marker}"
         # 更新 session：状态 DONE + marker + version + preview_url
         await session_store.update(
             session_id,
-            status=SessionStatus.COMPLETED,
+            status=SessionStatus.COMPLETED.value,
+            pipeline_state=PipelineState.DELIVERED.value,
             marker=marker,
             version=version,
             preview_url=preview_url,
+            fix_rounds=iteration,
+            verification_score=quality_score,
         )
 
         # 推送托管完成事件，再关闭 SSE 流
@@ -217,18 +237,6 @@ class GenerationRunner:
             db.add(record)
             await db.commit()
 
-    async def _save_page(self, marker: str, version: int, html: str, created_by: str) -> None:
-        """把生成的 HTML 存入 page_version 表"""
-        record = PageVersion(
-            marker=marker,
-            version=version,
-            html_content=html,
-            status=PageStatus.PUBLISHED,
-            created_by=created_by,
-        )
-        async with AsyncSessionLocal() as db:
-            db.add(record)
-            await db.commit()
 
 
     async def run_job(self, job_id: str) -> None:
@@ -261,7 +269,12 @@ class GenerationRunner:
             logger.exception("generation job failed: job_id=%s", job_id)
             # 失败：置 failed，supervisor_loop 主要是针对进程崩溃这种情况，干净异常失败（LLM 报错、验证抛异常）因为这类失败重跑大概率还是同样结果，自动重试没意义，交给用户重新发起。
             await generation_job_store.mark_failed(job_id, _OWNER, str(e) or type(e).__name__)
-            await session_store.update(job.session_id, status=SessionStatus.FAILED)
+            await session_store.update(
+                job.session_id,
+                status=SessionStatus.FAILED.value,
+                pipeline_state=PipelineState.FAILED.value,
+                error_message=str(e) or type(e).__name__,
+            )
         finally:
             # 确保心跳任务被取消，避免僵尸任务
             heartbeat_task.cancel()

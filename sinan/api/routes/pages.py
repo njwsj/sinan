@@ -9,6 +9,7 @@ from sqlalchemy import select, desc
 
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import PageVersion
+from sinan.models.tables import Page, PageVersion
 
 router = APIRouter(prefix="/api/page", tags=["pages"])
 
@@ -17,19 +18,23 @@ router = APIRouter(prefix="/api/page", tags=["pages"])
 async def list_page_versions(marker: str):
     """列出 marker 下所有版本（桩：不含内容，仅元数据）。"""
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
+        page = (await db.execute(select(Page).where(Page.marker == marker))).scalar_one_or_none()
+        versions = (await db.execute(
             select(PageVersion)
             .where(PageVersion.marker == marker)
             .order_by(desc(PageVersion.version))
-        )
-        versions = result.scalars().all()
+        )).scalars().all()
 
     return {
         "marker": marker,
+        "status": page.status if page else None,
+        "current_version": page.current_version if page else 0,
+        "published_version": page.published_version if page else None,
         "versions": [
             {
                 "version": v.version,
-                "status": v.status.value if v.status else None,
+                "code_size": v.code_size,
+                "harness_score": v.harness_score,
                 "created_at": v.created_at.isoformat() if v.created_at else None,
             }
             for v in versions

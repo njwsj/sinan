@@ -1117,6 +1117,53 @@ alembic/
 - Artifact 可以保存中间产物；
 - 查询不会跨用户泄露数据。
 
+## 实施结论（2026-08-17，代码已落地）
+
+落地方式与 6.3/6.4 的原计划不同：**不引入 Alembic，改为库级隔离**。新建空库 `sinan_v2`，
+本分支把 `settings.db_name` 指过去，由 `create_all()` 建全部新表；旧库 `sinan` 原样保留，
+Step 5 及之前的分支切回去即可正常运行。学习型项目没有需要保住的存量数据，
+迁移脚本、数据回填和 downgrade 的成本大于收益。
+
+改动文件：
+
+```text
+sinan/config/settings.py            db_name → sinan_v2；redis_db → 1（按分支隔离库与事件键）
+sinan/models/enums.py               新增 PipelineState(11 态)/JobStatus/PageSource；SessionStatus 改参考取值；PageStatus 增 preview
+sinan/models/tables.py              9 张表：GenSession/GenSessionStep/GenerationJob/GenerationArtifact/Page/PageVersion/Attachment/SkillDefinition/PageTemplate
+sinan/services/page_store.py        save() 单事务 upsert page + 写 page_version 快照 + 推进 current_version；新增 get_page/publish
+sinan/services/session_store.py     create() 写 status=active / pipeline_state=init / title / attachments
+sinan/services/generation_runner.py 4 处状态写入改字符串取值并带 pipeline_state；删除死代码 _save_page
+sinan/api/routes/pages.py           页面级状态从 Page 主表读，版本级只返回快照字段
+sinan/api/routes/preview.py         同上；版本详情返回 content_hash
+sinan/api/routes/session.py         status/pipeline_state 直接返回字符串
+sinan/api/routes/audit.py           同上
+```
+
+关键设计决定：
+
+- 所有 status 列统一 `String(32)`，与参考一致。数据库 ENUM 每加一个状态就要 ALTER，Step 7/8 还会继续扩状态；取值约束交给 Python 侧的 `str, Enum`；
+- `GenSession.status` 采用参考取值（active/paused/…），旧的 pending/running 语义下沉到 `GenerationJob.status` 与新增的 `pipeline_state` 列。新库无存量数据，一次切到位；
+- `page` 成为主表，`page_version` 卸掉 `status`/`owner`/`updated_at`，变成不可变快照；
+- `PageVersion.html_content` 保留、`bos_path` 可空：Step 9 才接对象存储，本 Step 只把参考的列位打出来；
+- `GenerationArtifact`/`Attachment` 的 `metadata` 列以属性名 `meta` 映射，因为 `metadata` 是 SQLAlchemy 声明式保留属性名；
+- `attachment` 表参考项目并不存在（参考存在 `generation_session.attachments` JSON），本 Step 只建表不切流量，避免双写不一致；
+- 不建 `sys_user`/`buddy_profile`：认证 Step 3 已定"暂不实现"，buddy 与页面生成无关。
+
+遗留项（记录在 `docs/compatibility/storage-matrix.md` 与 `state-matrix.md`）：
+
+- 旧库数据未迁移，`sinan` 库的历史 Session/PageVersion 在新库不可见；
+- 无迁移工具，后续模型变更仍需重建库，有真实数据后必须补 Alembic；
+- `generation_artifact`/`attachment`/`skill_definition`/`page_template` 只建表，无写入点（Step 7/9/11/12）；
+- `pipeline_state` 只有 init/analysis/delivered/failed 四个写入点，中间阶段待 Step 7/8；
+- `gen_session.attachments` 恒为 `[]`：`create_or_get()` 未透传 attachments，runner 仍从 `job.request_payload` 读；
+- 取消仍落 `failed` + `error_message="cancelled by user"`，参考无 cancelled 会话态，等价性待 Step 15；
+- `generation_job_store.py` 仍用裸字符串常量，未收敛到 `JobStatus`；
+- `next_version()` 与 `save()` 非原子，同 marker 并发生成会撞 `uk_marker_version`（既有行为）；
+- 「查询不跨用户泄露」只做到结构就绪（`page.owner`、`gen_session.user_id` 索引），实际过滤依赖认证，当前 `auth_mode="none"` 无法验证，待 Step 3/15。
+
+运行前置：新库需先手工创建 —— `CREATE DATABASE sinan_v2 CHARACTER SET utf8mb4;`，
+且 `.env` 中不能出现 `DB_NAME`/`REDIS_DB`（env 优先级高于 settings 默认值，会盖掉分支隔离）。
+
 ---
 
 # Step 7：对齐 Native LangGraph 和 Harness

@@ -4,18 +4,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import select, update, or_, and_, func
+from sinan.models.enums import JobStatus
 
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import GenerationJob
 
-# Job 状态常量（字符串列，便于批量 UPDATE）
-PENDING = "pending"
-RUNNING = "running"
-COMPLETED = "completed"
-FAILED = "failed"
-CANCELLED = "cancelled"
+# Job 状态常量：取值统一来自 JobStatus，避免枚举与 SQL 条件漂移
+PENDING = JobStatus.PENDING.value
+RUNNING = JobStatus.RUNNING.value
+WAITING = JobStatus.WAITING.value
+COMPLETED = JobStatus.COMPLETED.value
+FAILED = JobStatus.FAILED.value
+CANCELLED = JobStatus.CANCELLED.value
 TERMINAL_STATUSES = {COMPLETED, FAILED, CANCELLED}
-ACTIVE_STATUSES = {PENDING, RUNNING}
+ACTIVE_STATUSES = {PENDING, RUNNING}   # Step 8 引入 waiting 后需一并评估是否纳入
 
 
 @dataclass

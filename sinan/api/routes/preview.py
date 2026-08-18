@@ -3,7 +3,7 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select, desc
 from sinan.models.database import AsyncSessionLocal
-from sinan.models.tables import PageVersion
+from sinan.models.tables import Page, PageVersion
 
 """
 从 PageVersion 表查询该 marker 下 version 最大的记录，把 html_content 直接以 text/html 返回，浏览器打开就能渲染。
@@ -49,6 +49,7 @@ async def preview_page(marker: str):
 async def list_versions(marker: str):
     """列出 marker 下的所有版本（不含 html_content）。"""
     async with AsyncSessionLocal() as db:
+        page = (await db.execute(select(Page).where(Page.marker == marker))).scalar_one_or_none()
         result = await db.execute(
             select(PageVersion)
             .where(PageVersion.marker == marker)
@@ -61,10 +62,12 @@ async def list_versions(marker: str):
 
     return {
         "marker": marker,
+        "status": page.status if page else None,
+        "current_version": page.current_version if page else 0,
         "versions": [
             {
                 "version": v.version,
-                "status": v.status,
+                "code_size": v.code_size,
                 "created_at": v.created_at.isoformat(),
             }
             for v in versions
@@ -88,8 +91,8 @@ async def get_page_version(marker: str, version_num: int):
     return {
         "marker": page.marker,
         "version": page.version,
-        "status": page.status,
         "html_content": page.html_content,
+        "content_hash": page.content_hash,
         "created_at": page.created_at.isoformat(),
     }
 

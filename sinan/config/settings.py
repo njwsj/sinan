@@ -12,12 +12,12 @@ class Settings(BaseSettings):
     db_port: int = 3306
     db_user: str = "root"
     db_password: str = ""
-    db_name: str = "sinan"
+    db_name: str = "sinan_v2"
 
     # --- Redis（保留旧字段）---
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
-    redis_db: int = 0
+    redis_db: int = 1
     redis_max_connections: int = 64
 
 

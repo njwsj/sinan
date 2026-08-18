@@ -21,7 +21,8 @@ async def get_session(session_id: str):
 
     return {
         "session_id": session.session_id,
-        "status": session.status.value if session.status else None,
+        "status": session.status,
+        "pipeline_state": session.pipeline_state,
         "marker": session.marker,
         "version": session.version,
         "preview_url": session.preview_url,
