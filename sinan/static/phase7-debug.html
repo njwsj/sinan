@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Sinan 调试页面</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { display: flex; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f0f2f5; color: #1a1a1a; }
+
+    /* ── 左栏：对话框 ── */
+    #sidebar {
+      width: 340px; min-width: 260px; display: flex; flex-direction: column;
+      background: #fff; border-right: 1px solid #e0e0e0;
+    }
+    #sidebar-header {
+      padding: 16px 20px; font-size: 15px; font-weight: 600; border-bottom: 1px solid #e8e8e8;
+      background: #fff;
+    }
+    #chat-messages {
+      flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px;
+    }
+    .msg { max-width: 88%; padding: 9px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.55; word-break: break-word; }
+    .msg-user { align-self: flex-end; background: #1677ff; color: #fff; border-bottom-right-radius: 4px; }
+    .msg-assistant { align-self: flex-start; background: #f4f4f5; color: #1a1a1a; border-bottom-left-radius: 4px; }
+
+    #progress-box {
+      margin: 0 16px 8px; padding: 10px 12px; background: #f9f9f9; border: 1px solid #eee;
+      border-radius: 8px; font-size: 12px; color: #555; display: none;
+    }
+    #progress-box .step-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+    #progress-box .dot { width: 8px; height: 8px; border-radius: 50%; background: #d9d9d9; flex-shrink: 0; }
+    #progress-box .dot.active { background: #1677ff; }
+    #progress-box .dot.done { background: #52c41a; }
+
+    #input-area { padding: 12px 16px; border-top: 1px solid #e8e8e8; display: flex; gap: 8px; align-items: flex-end; }
+    #prompt-input {
+      flex: 1; resize: none; border: 1px solid #d9d9d9; border-radius: 8px; padding: 8px 11px;
+      font-size: 13.5px; line-height: 1.5; outline: none; font-family: inherit;
+      max-height: 120px; overflow-y: auto;
+    }
+    #prompt-input:focus { border-color: #1677ff; }
+    #send-btn {
+      padding: 8px 18px; background: #1677ff; color: #fff; border: none; border-radius: 8px;
+      font-size: 13.5px; cursor: pointer; height: 36px; flex-shrink: 0;
+    }
+    #send-btn:hover { background: #0e65e8; }
+    #send-btn:disabled { background: #aaa; cursor: not-allowed; }
+    #cancel-btn {
+      padding: 8px 14px; background: #fff; color: #d9363e; border: 1px solid #d9363e;
+      border-radius: 8px; font-size: 13px; cursor: pointer; height: 36px; flex-shrink: 0; display: none;
+    }
+    #cancel-btn:hover { background: #fff1f0; }
+
+    /* ── 附件区 ── */
+    #attachment-area {
+      margin: 0 16px 8px; border: 1px dashed #d9d9d9; border-radius: 8px;
+      background: #fafafa; overflow: hidden;
+    }
+    #upload-btn-wrap {
+      display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer;
+    }
+    #upload-btn-wrap:hover { background: #f0f7ff; }
+    #upload-file-input { display: none; }
+    #upload-label { font-size: 12.5px; color: #888; cursor: pointer; flex: 1; }
+    #upload-icon { font-size: 16px; color: #aaa; }
+    #attachment-list { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px; }
+    .att-item {
+      display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+      background: #fff; border: 1px solid #e8e8e8; border-radius: 6px; font-size: 12px;
+    }
+    .att-item .att-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
+    .att-item .att-meta { color: #aaa; flex-shrink: 0; }
+    .att-item .att-del {
+      color: #ccc; cursor: pointer; flex-shrink: 0; font-size: 14px; line-height: 1;
+      padding: 0 2px;
+    }
+    .att-item .att-del:hover { color: #ff4d4f; }
+    .att-uploading { color: #1677ff; }
+
+    /* ── 右栏：结果面板 ── */
+    #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #tabs-bar {
+      display: flex; border-bottom: 1px solid #e0e0e0; background: #fff; padding: 0 20px;
+    }
+    .tab {
+      padding: 14px 18px; font-size: 13.5px; cursor: pointer; border-bottom: 2px solid transparent;
+      color: #666; user-select: none; transition: color .15s;
+    }
+    .tab:hover { color: #1677ff; }
+    .tab.active { color: #1677ff; border-bottom-color: #1677ff; font-weight: 500; }
+    .tab-badge {
+      display: inline-block; margin-left: 5px; padding: 1px 6px; font-size: 11px;
+      border-radius: 10px; background: #e8f0fe; color: #1677ff; vertical-align: middle;
+    }
+
+    #panels { flex: 1; overflow: hidden; position: relative; }
+    .panel {
+      position: absolute; inset: 0; padding: 24px 28px; overflow-y: auto;
+      display: none; background: #fff;
+    }
+    .panel.active { display: block; }
+
+    /* 内容区通用 */
+    .panel-placeholder { color: #bbb; font-size: 14px; margin-top: 40px; text-align: center; }
+    .content-pre {
+      white-space: pre-wrap; word-break: break-word; font-size: 13.5px; line-height: 1.75;
+      color: #333; font-family: inherit;
+    }
+
+    /* 代码 tab */
+    #code-wrap {
+      background: #1e1e2e; border-radius: 8px; padding: 16px; overflow: auto;
+      height: calc(100% - 8px);
+    }
+    #code-pre {
+      white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.6;
+      color: #cdd6f4; font-family: "JetBrains Mono", "Fira Code", monospace;
+    }
+    #code-len { font-size: 12px; color: #888; margin-bottom: 10px; }
+
+    /* 验证报告 tab */
+    .verify-badge {
+      display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 12px;
+      font-weight: 600; margin-left: 10px;
+    }
+    .verify-badge.pass { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+    .verify-badge.fail { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffa39e; }
+    .issue-item { margin: 6px 0; padding: 8px 12px; background: #fff2f0; border-left: 3px solid #ff4d4f; border-radius: 4px; font-size: 13px; color: #cf1322; }
+
+    /* 预览 tab */
+    #preview-frame { width: 100%; height: calc(100% - 8px); border: none; border-radius: 8px; background: #fff; }
+
+    /* 状态栏 */
+    #status-bar {
+      padding: 6px 20px; font-size: 12px; color: #888; background: #fafafa;
+      border-top: 1px solid #eee; display: flex; align-items: center; gap: 8px;
+    }
+    #status-dot { width: 7px; height: 7px; border-radius: 50%; background: #d9d9d9; flex-shrink: 0; }
+    #status-dot.running { background: #1677ff; animation: pulse 1.2s infinite; }
+    #status-dot.done { background: #52c41a; }
+    #status-dot.error { background: #ff4d4f; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  </style>
+</head>
+<body>
+
+<!-- 左栏 -->
+<div id="sidebar">
+  <div id="sidebar-header">Sinan 调试</div>
+  <div id="chat-messages"></div>
+  <div id="progress-box"></div>
+  <!-- 附件上传区 -->
+  <div id="attachment-area">
+    <label id="upload-btn-wrap" for="upload-file-input">
+      <span id="upload-icon">📎</span>
+      <span id="upload-label">上传 Excel 文件（.xlsx / .xls）</span>
+      <input type="file" id="upload-file-input" accept=".xlsx,.xls" />
+    </label>
+    <div id="attachment-list"></div>
+  </div>
+  <div id="input-area">
+    <textarea id="prompt-input" rows="2" placeholder="输入页面需求，按 Ctrl+Enter 发送"></textarea>
+    <button id="send-btn">发送</button>
+    <button id="cancel-btn">取消</button>
+  </div>
+</div>
+
+<!-- 右栏 -->
+<div id="main">
+  <div id="tabs-bar">
+    <div class="tab active" data-tab="analysis">需求分析</div>
+    <div class="tab" data-tab="design">设计方案</div>
+    <div class="tab" data-tab="code">代码<span id="code-badge" class="tab-badge" style="display:none"></span></div>
+    <div class="tab" data-tab="verify">验证报告</div>
+    <div class="tab" data-tab="preview">预览</div>
+  </div>
+  <div id="panels">
+    <div class="panel active" id="panel-analysis">
+      <div class="panel-placeholder" id="analysis-placeholder">需求分析结果将在这里显示</div>
+      <pre class="content-pre" id="analysis-content" style="display:none"></pre>
+    </div>
+    <div class="panel" id="panel-design">
+      <div class="panel-placeholder" id="design-placeholder">设计方案将在这里显示</div>
+      <pre class="content-pre" id="design-content" style="display:none"></pre>
+    </div>
+    <div class="panel" id="panel-code">
+      <div id="code-len"></div>
+      <div id="code-wrap"><pre id="code-pre"></pre></div>
+    </div>
+    <div class="panel" id="panel-verify">
+      <div class="panel-placeholder" id="verify-placeholder">验证报告将在这里显示</div>
+      <div id="verify-content" style="display:none"></div>
+    </div>
+    <div class="panel" id="panel-preview">
+      <div class="panel-placeholder" id="preview-placeholder">生成完成后预览将在这里显示</div>
+      <iframe id="preview-frame" style="display:none"></iframe>
+    </div>
+  </div>
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">就绪</span>
+  </div>
+</div>
+
+<script>
+// ── 状态 ──
+let currentSessionId = null;
+let currentEventSource = null;
+let codeBuffer = "";
+let isRunning = false;
+// 已上传的附件列表，每项是后端返回的元数据对象
+// { file_id, filename, columns, row_count, preview }
+let uploadedAttachments = [];
+
+// ── 工具函数 ──
+function addMessage(text, role) {
+  const box = document.getElementById("chat-messages");
+  const div = document.createElement("div");
+  div.className = "msg msg-" + role;
+  div.textContent = text;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
+}
+
+function setStatus(state, text) {
+  const dot = document.getElementById("status-dot");
+  dot.className = "";
+  if (state) dot.classList.add(state);
+  document.getElementById("status-text").textContent = text;
+}
+
+function activateTab(name) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
+}
+
+// 进度步骤定义
+const STEPS = [
+  { key: "analyze",  label: "需求分析" },
+  { key: "design",   label: "设计方案" },
+  { key: "code",     label: "代码生成" },
+  { key: "verify",   label: "验证" },
+  { key: "fix",      label: "自动修复" },
+];
+
+function buildProgressBox() {
+  const box = document.getElementById("progress-box");
+  box.innerHTML = "";
+  box.style.display = "block";
+  STEPS.forEach(s => {
+    const item = document.createElement("div");
+    item.className = "step-item";
+    item.id = "step-" + s.key;
+    item.innerHTML = `<div class="dot" id="dot-${s.key}"></div><span>${s.label}</span>`;
+    box.appendChild(item);
+  });
+}
+
+function markStep(key, state) {
+  const dot = document.getElementById("dot-" + key);
+  if (dot) { dot.className = "dot " + state; }
+}
+
+function setRunning(flag) {
+  isRunning = flag;
+  document.getElementById("send-btn").disabled = flag;
+  document.getElementById("cancel-btn").style.display = flag ? "inline-block" : "none";
+}
+
+// ── 重置 UI ──
+function resetUI() {
+  codeBuffer = "";
+  document.getElementById("analysis-placeholder").style.display = "block";
+  document.getElementById("analysis-content").style.display = "none";
+  document.getElementById("analysis-content").textContent = "";
+  document.getElementById("design-placeholder").style.display = "block";
+  document.getElementById("design-content").style.display = "none";
+  document.getElementById("design-content").textContent = "";
+  document.getElementById("code-pre").textContent = "";
+  document.getElementById("code-len").textContent = "";
+  document.getElementById("code-badge").style.display = "none";
+  document.getElementById("verify-placeholder").style.display = "block";
+  document.getElementById("verify-content").style.display = "none";
+  document.getElementById("verify-content").innerHTML = "";
+  document.getElementById("preview-placeholder").style.display = "block";
+  document.getElementById("preview-frame").style.display = "none";
+  document.getElementById("preview-frame").src = "";
+  document.getElementById("progress-box").style.display = "none";
+  activateTab("analysis");
+  // 注意：不清 uploadedAttachments，允许多次发送复用同一批附件
+}
+
+// ── 附件上传 ──
+function renderAttachmentList() {
+  const list = document.getElementById("attachment-list");
+  list.innerHTML = "";
+  uploadedAttachments.forEach((att, idx) => {
+    const item = document.createElement("div");
+    item.className = "att-item";
+    item.innerHTML = `
+      <span class="att-name" title="${att.filename}">${att.filename}</span>
+      <span class="att-meta">${att.columns ? att.columns.length + ' 列' : ''} ${att.row_count ? att.row_count + ' 行' : ''}</span>
+      <span class="att-del" onclick="removeAttachment(${idx})" title="移除">✕</span>
+    `;
+    list.appendChild(item);
+  });
+}
+
+function removeAttachment(idx) {
+  uploadedAttachments.splice(idx, 1);
+  renderAttachmentList();
+}
+
+async function handleFileUpload(file) {
+  const label = document.getElementById("upload-label");
+  const origText = label.textContent;
+  label.textContent = `上传中：${file.name}...`;
+  label.classList.add("att-uploading");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try {
+    const res = await fetch("/api/v1/data/upload", {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || "上传失败");
+    }
+    const meta = await res.json();
+    // meta: { file_id, filename, columns, row_count, preview }
+    uploadedAttachments.push(meta);
+    renderAttachmentList();
+    addMessage(`已上传：${meta.filename}（${meta.row_count} 行，${meta.columns.length} 列）`, "assistant");
+  } catch (err) {
+    addMessage(`上传失败：${err.message}`, "assistant");
+  } finally {
+    label.textContent = origText;
+    label.classList.remove("att-uploading");
+    // 清空 input，允许重复选同一文件
+    document.getElementById("upload-file-input").value = "";
+  }
+}
+
+// ── SSE 处理 ──
+function connectSSE(sessionId) {
+  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+
+  const url = `/api/page/generate/${sessionId}/stream`;
+  const es = new EventSource(url);
+  currentEventSource = es;
+
+  // 通用：所有 message（无 event 字段时）
+  es.addEventListener("session_init", e => {
+    const d = JSON.parse(e.data);
+    setStatus("running", "已连接，等待生成...");
+    buildProgressBox();
+  });
+
+  es.addEventListener("step", e => {
+    const d = JSON.parse(e.data);
+    const stepKey = d.step;
+    STEPS.forEach(s => markStep(s.key, ""));
+    // 将之前的步骤标记为 done，当前标记为 active
+    let found = false;
+    STEPS.forEach(s => {
+      if (s.key === stepKey) { markStep(s.key, "active"); found = true; }
+      else if (!found) { markStep(s.key, "done"); }
+    });
+    setStatus("running", d.message || ("正在执行：" + stepKey));
+    // 自动切到对应 tab（analyze/design 由 delta 事件驱动切换，这里只切 code/verify）
+    if (stepKey === "code" || stepKey === "fix") activateTab("code");
+    else if (stepKey === "verify") activateTab("verify");
+    else if (stepKey === "analyze") activateTab("analysis");
+    else if (stepKey === "design") activateTab("design");
+  });
+
+  es.addEventListener("analysis_delta", e => {
+    const d = JSON.parse(e.data);
+    const el = document.getElementById("analysis-content");
+    el.textContent += d.delta || "";
+    el.style.display = "block";
+    document.getElementById("analysis-placeholder").style.display = "none";
+  });
+
+  es.addEventListener("analysis_result", e => {
+    // 断线重连后用完整内容直接填充（流式已经显示的情况下跳过）
+    const el = document.getElementById("analysis-content");
+    if (!el.textContent) {
+      const d = JSON.parse(e.data);
+      el.textContent = d.content || "";
+      el.style.display = "block";
+      document.getElementById("analysis-placeholder").style.display = "none";
+    }
+    activateTab("design");  // 分析完成，自动跳到设计方案 tab
+  });
+
+  es.addEventListener("design_delta", e => {
+    const d = JSON.parse(e.data);
+    const el = document.getElementById("design-content");
+    el.textContent += d.delta || "";
+    el.style.display = "block";
+    document.getElementById("design-placeholder").style.display = "none";
+  });
+
+  es.addEventListener("design_result", e => {
+    // 断线重连后用完整内容直接填充
+    const el = document.getElementById("design-content");
+    if (!el.textContent) {
+      const d = JSON.parse(e.data);
+      el.textContent = d.content || "";
+      el.style.display = "block";
+      document.getElementById("design-placeholder").style.display = "none";
+    }
+  });
+
+  es.addEventListener("code_start", e => {
+    codeBuffer = "";
+    document.getElementById("code-pre").textContent = "";
+    document.getElementById("code-len").textContent = "";
+    activateTab("code");
+  });
+
+  es.addEventListener("code_delta", e => {
+    const d = JSON.parse(e.data);
+    codeBuffer += d.delta || "";
+    document.getElementById("code-pre").textContent = codeBuffer;
+    document.getElementById("code-len").textContent = `已生成 ${d.accumulated_len} 字符`;
+    // 滚动到底
+    const wrap = document.getElementById("code-wrap");
+    wrap.scrollTop = wrap.scrollHeight;
+  });
+
+  es.addEventListener("code_stream_end", e => {
+    const d = JSON.parse(e.data);
+    const badge = document.getElementById("code-badge");
+    badge.textContent = (d.accumulated_len / 1000).toFixed(1) + "k";
+    badge.style.display = "inline-block";
+  });
+
+  es.addEventListener("verify_start", e => {
+    activateTab("verify");
+    document.getElementById("verify-placeholder").textContent = "验证中...";
+  });
+
+  es.addEventListener("verify_result", e => {
+    const d = JSON.parse(e.data);
+    const box = document.getElementById("verify-content");
+    box.style.display = "block";
+    document.getElementById("verify-placeholder").style.display = "none";
+    const passedHtml = d.passed
+      ? `<span class="verify-badge pass">通过</span>`
+      : `<span class="verify-badge fail">未通过</span>`;
+    let html = `<div style="font-size:14px;font-weight:600;margin-bottom:12px">验证结果 ${passedHtml}</div>`;
+
+    // 验证检查项目清单
+    const checks = [
+      { label: "DOCTYPE 声明", key: "doctype" },
+      { label: "html 标签", key: "html_tag" },
+      { label: "body 标签", key: "body_tag" },
+      { label: "HTML 长度", key: "html_length" },
+      { label: "浏览器渲染", key: "browser" },
+    ];
+    // 判断哪些检查项出了问题（从 issues 里反推）
+    const issueTexts = Array.isArray(d.issues) ? d.issues : [];
+    if (d.passed) {
+      html += `<div style="margin-bottom:14px">`;
+      checks.forEach(c => {
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:13px">
+          <span style="color:#52c41a;font-size:14px">✓</span><span>${c.label}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    } else {
+      // 把 issues 每项对应的检查显示为红，其他显示为绿
+      const failKeywords = {
+        "DOCTYPE": "DOCTYPE 声明",
+        "<html>": "html 标签",
+        "<body>": "body 标签",
+        "过短": "HTML 长度",
+        "浏览器": "浏览器渲染",
+        "JS": "浏览器渲染",
+        "console": "浏览器渲染",
+      };
+      const failedLabels = new Set();
+      issueTexts.forEach(iss => {
+        Object.entries(failKeywords).forEach(([kw, label]) => {
+          if (iss.includes(kw)) failedLabels.add(label);
+        });
+      });
+      html += `<div style="margin-bottom:14px">`;
+      checks.forEach(c => {
+        const failed = failedLabels.has(c.label);
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:13px">
+          <span style="color:${failed ? '#ff4d4f' : '#52c41a'};font-size:14px">${failed ? '✗' : '✓'}</span>
+          <span style="color:${failed ? '#cf1322' : '#333'}">${c.label}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+    if (issueTexts.length > 0) {
+      html += `<div style="font-size:13px;font-weight:500;margin-bottom:6px;color:#333">问题详情：</div>`;
+      issueTexts.forEach(issue => {
+        html += `<div class="issue-item">${issue}</div>`;
+      });
+    }
+    if (d.message && d.message !== "校验通过") {
+      html += `<div style="margin-top:10px;font-size:12.5px;color:#666">${d.message}</div>`;
+    }
+    if (d.quality_score !== undefined) {
+      html += `<div style="margin-top:12px;font-size:12px;color:#aaa">质量评分：${d.quality_score}</div>`;
+    }
+    box.innerHTML = html;
+    markStep("verify", "done");
+    activateTab("verify");
+  });
+
+  es.addEventListener("fix_applied", e => {
+    const d = JSON.parse(e.data);
+    markStep("fix", "done");
+    addMessage(`自动修复完成（第 ${d.round} 轮）`, "assistant");
+  });
+
+  es.addEventListener("gate_passed", e => {
+    // 静默处理
+  });
+
+  es.addEventListener("completed", e => {
+    const d = JSON.parse(e.data);
+    setStatus("done", `生成完成（版本 ${d.version}）`);
+    STEPS.forEach(s => markStep(s.key, "done"));
+    addMessage(`页面生成完成，版本 ${d.version}`, "assistant");
+    // 加载预览
+    if (d.preview_url) {
+      const frame = document.getElementById("preview-frame");
+      frame.src = d.preview_url;
+      frame.style.display = "block";
+      document.getElementById("preview-placeholder").style.display = "none";
+    }
+    activateTab("preview");
+    setRunning(false);
+    es.close();
+  });
+
+  es.addEventListener("error", e => {
+    let msg = "生成失败";
+    try { const d = JSON.parse(e.data); msg = d.message || msg; } catch (_) {}
+    setStatus("error", msg);
+    addMessage("错误：" + msg, "assistant");
+    setRunning(false);
+    es.close();
+  });
+
+  es.addEventListener("cancelled", e => {
+    setStatus("", "已取消");
+    addMessage("生成已取消", "assistant");
+    setRunning(false);
+    es.close();
+  });
+
+  es.onerror = err => {
+    if (es.readyState === EventSource.CLOSED) return;
+    console.warn("SSE error", err);
+  };
+}
+
+// ── 发送 ──
+async function sendPrompt() {
+  const input = document.getElementById("prompt-input");
+  const prompt = input.value.trim();
+  if (!prompt || isRunning) return;
+
+  resetUI();
+  input.value = "";
+  addMessage(prompt, "user");
+  setRunning(true);
+  setStatus("running", "正在提交...");
+
+  // 每次发送都新建 session
+  currentSessionId = null;
+
+  try {
+    const legacyRes = await fetch("/api/v1/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        attachments: uploadedAttachments.map(att => ({
+          file_id: att.file_id,
+          filename: att.filename,
+          columns: att.columns,
+          row_count: att.row_count,
+        })),
+      }),
+    });
+    if (!legacyRes.ok) {
+      const err = await legacyRes.text();
+      throw new Error("请求失败：" + err);
+    }
+    const data = await legacyRes.json();
+    currentSessionId = data.session_id;
+    connectSSE(currentSessionId);
+  } catch (err) {
+    setStatus("error", "请求失败");
+    addMessage("请求失败：" + err.message, "assistant");
+    setRunning(false);
+  }
+}
+
+// ── 取消 ──
+async function cancelGeneration() {
+  if (!currentSessionId) return;
+  await fetch(`/api/page/generate/${currentSessionId}/cancel`, { method: "POST" });
+}
+
+// ── 事件绑定 ──
+document.getElementById("send-btn").addEventListener("click", sendPrompt);
+document.getElementById("cancel-btn").addEventListener("click", cancelGeneration);
+document.getElementById("prompt-input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendPrompt();
+});
+document.getElementById("upload-file-input").addEventListener("change", e => {
+  const file = e.target.files[0];
+  if (file) handleFileUpload(file);
+});
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => activateTab(tab.dataset.tab));
+});
+</script>
+</body>
+</html>

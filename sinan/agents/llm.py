@@ -1,4 +1,5 @@
 # sinan/agents/llm.py
+import asyncio
 import json
 import logging
 
@@ -64,42 +65,59 @@ class LLMClient:
     async def astream(self, messages: list[dict], temperature: float = 0.7):
         """
         流式调用 LLM，逐 token yield 文本片段。
-        用于 coder 节点实时推送代码生成进度。
+        用于 coder/analyzer/designer 节点实时推送生成进度。
+        429 限流时等待后重试（最多 5 次，指数退避 5s→10s→20s→40s→60s）。
         """
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "stream": True,
-                },
-            ) as resp:
-                if not resp.is_success:
-                    body = await resp.aread()
-                    logger.error("LLM stream error: status=%d body=%s", resp.status_code, body)
-                    resp.raise_for_status()
-                buffer = ""
-                async for chunk_text in resp.aiter_text():
-                    buffer += chunk_text
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.rstrip("\r")
-                        if not line or not line.startswith("data: "):
+        for attempt in range(5):
+            try:
+                async with httpx.AsyncClient(timeout=300) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "stream": True,
+                        },
+                    ) as resp:
+                        if resp.status_code == 429:
+                            wait = min(5 * (2 ** attempt), 60)
+                            logger.warning("LLM stream 429, retry %d/%d after %ds", attempt + 1, 5, wait)
+                            await asyncio.sleep(wait)
                             continue
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
-                            return
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk["choices"][0]["delta"].get("content", "")
-                            if delta:
-                                yield delta
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
+                        if not resp.is_success:
+                            body = await resp.aread()
+                            logger.error("LLM stream error: status=%d body=%s", resp.status_code, body)
+                            resp.raise_for_status()
+                        buffer = ""
+                        async for chunk_text in resp.aiter_text():
+                            buffer += chunk_text
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.rstrip("\r")
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data = line[6:]
+                                if data.strip() == "[DONE]":
+                                    return
+                                try:
+                                    chunk = json.loads(data)
+                                    delta = chunk["choices"][0]["delta"].get("content", "")
+                                    if delta:
+                                        yield delta
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+                        return  # 正常完成
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < 4:
+                    wait = min(5 * (2 ** attempt), 60)
+                    logger.warning("LLM stream 429 (exc), retry %d/%d after %ds", attempt + 1, 5, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("LLM stream 429 限流，已重试 5 次仍失败")

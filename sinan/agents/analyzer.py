@@ -2,6 +2,8 @@
 import json
 from sinan.agents.llm import LLMClient
 from sinan.agents.state import PageGenState
+from sinan.services.generation_event_bus import event_bus
+from sinan.models import events
 
 SYSTEM_PROMPT = """你是一个需求分析专家。
 分析用户的页面需求，输出结构化的需求清单。
@@ -44,6 +46,8 @@ class AnalyzerAgent:
         self.llm = llm
 
     async def run(self, state: PageGenState) -> dict:
+        session_id = state.get("session_id", "")
+        marker = state.get("marker")
         user_content = state["prompt"]
 
         # 从结构化 attachments 读取数据，各自构造上下文注入 prompt
@@ -55,5 +59,25 @@ class AnalyzerAgent:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
-        requirements = await self.llm.chat(messages, temperature=0.3)
+
+        # 流式生成，逐 token 推 analysis_delta 事件
+        chunks: list[str] = []
+        accumulated_len = 0
+        async for token in self.llm.astream(messages, temperature=0.3):
+            chunks.append(token)
+            accumulated_len += len(token)
+            if session_id:
+                await event_bus.publish(
+                    session_id, events.ANALYSIS_DELTA,
+                    events.analysis_delta_data(token, accumulated_len),
+                    marker=marker,
+                )
+        requirements = "".join(chunks)
+        # 流结束后推一条完整内容事件，方便断线重连后直接填充
+        if session_id:
+            await event_bus.publish(
+                session_id, events.ANALYSIS_RESULT,
+                events.analysis_result_data(requirements),
+                marker=marker,
+            )
         return {"requirements": requirements}

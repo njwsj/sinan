@@ -36,6 +36,10 @@ VERIFY_START = "verify_start"       # 验证开始
 VERIFY_RESULT = "verify_result"     # 验证结果（passed / issues / score）
 FIX_START = "fix_start"             # 自动修复轮次开始
 FIX_APPLIED = "fix_applied"         # 修复轮次完成
+ANALYSIS_DELTA = "analysis_delta"   # 需求分析 token 增量（流式）
+ANALYSIS_RESULT = "analysis_result" # 需求分析完成（流结束）
+DESIGN_DELTA = "design_delta"       # 设计方案 token 增量（流式）
+DESIGN_RESULT = "design_result"     # 设计方案完成（流结束）
 SKILL_RUNNING = "skill_running"     # Skill 执行中（Step 12 实现）
 SKILL_RESULT = "skill_result"       # Skill 执行结果（Step 12 实现）
 KNOWLEDGE_SOURCE = "knowledge_source"           # 知识库摄取（Step 12 实现）
@@ -242,3 +246,23 @@ def error_data(message: str, code: str = "INTERNAL_ERROR") -> dict:
 def cancelled_data(message: str = "生成已取消") -> dict:
     """用户取消事件。"""
     return {"message": message}
+
+
+def analysis_result_data(content: str) -> dict:
+    """需求分析完成事件（流结束）。content 是完整需求分析文本。"""
+    return {"content": content}
+
+
+def design_result_data(content: str) -> dict:
+    """设计方案完成事件（流结束）。content 是完整设计方案文本。"""
+    return {"content": content}
+
+
+def analysis_delta_data(delta: str, accumulated_len: int) -> dict:
+    """需求分析 token 增量事件。"""
+    return {"delta": delta, "accumulated_len": accumulated_len}
+
+
+def design_delta_data(delta: str, accumulated_len: int) -> dict:
+    """设计方案 token 增量事件。"""
+    return {"delta": delta, "accumulated_len": accumulated_len}

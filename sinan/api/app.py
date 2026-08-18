@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sinan.api.context import new_trace_id, request_user_var, trace_id_var
 import time
 import logging
+from pathlib import Path
 from sinan.core.exceptions import SinanError
-from fastapi.responses import JSONResponse
 
 from sinan.config.settings import settings
 from sinan.core.logging import setup_logging
@@ -35,7 +37,7 @@ async def lifespan(app: FastAPI):
     from sinan.services.redis import create_redis
     create_redis()
     from sinan.services.generation_supervisor import start_supervisor, stop_supervisor
-    await start_supervisor()
+    # await start_supervisor()
     yield
     # 服务器关闭时：在此处添加清理逻辑
     """
@@ -69,6 +71,15 @@ def create_app() -> FastAPI:
             user,
         )
         return response
+
+    # 静态文件（调试页面）
+    _static_dir = Path(__file__).parent.parent / "static"
+    if _static_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
+    @app.get("/debug", include_in_schema=False)
+    async def debug_page():
+        return FileResponse(str(_static_dir / "phase7-debug.html"))
 
     # 参考项目主路径（各 router 自带 /api/page 前缀）
     app.include_router(health_router)

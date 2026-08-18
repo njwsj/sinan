@@ -118,9 +118,11 @@ class GenerationRunner:
                         )
                         await self._write_step(session_id, node_name, f"开始{node_name}")
 
-                # 图执行结束后拿到最终 state
-                elif kind == "on_chain_end" and event.get("run_id") and name == "LangGraph":
-                    final_state = event["data"].get("output")
+                # 节点结束：只用于捕获整图完成后的最终 state
+                elif kind == "on_chain_end":
+                    # 图执行结束后拿到最终 state
+                    if event.get("run_id") and name == "LangGraph":
+                        final_state = event["data"].get("output")
 
             # 如果经历了修复，推送修复事件
             iteration = final_state.get("iteration", 0)

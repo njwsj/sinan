@@ -29,5 +29,5 @@ class VerifierAgent:
             errors.extend(browser_result["issues"])
 
         if errors:
-            return {"verified": False, "verify_message": "；".join(errors)}
-        return {"verified": True, "verify_message": "校验通过"}
+            return {"verified": False, "verify_message": "；".join(errors), "issues": errors}
+        return {"verified": True, "verify_message": "校验通过", "issues": []}
