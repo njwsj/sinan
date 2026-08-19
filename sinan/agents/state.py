@@ -1,54 +1,67 @@
 # sinan/agents/state.py
-from typing import TypedDict
+"""LangGraph 节点之间共享的流水线状态。键名与参考 page/agents/state.py 1:1。
+
+旧键映射：prompt→user_input，requirements→requirement_doc + analysis_output，
+design→design_doc，html→code(+code_hash/code_files)，
+verified/verify_message→verification_result，iteration→fix_round，
+max_iterations→max_fix_rounds，gate_decision→gate_reports（列表，每条含 decision）。
+"""
+from __future__ import annotations
+
+from typing import Annotated, Literal, TypedDict
+
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 
 
-class PageGenState(TypedDict):
-    """LangGraph 节点之间共享的流水线状态。"""
+class GenerationState(TypedDict, total=False):
+    # ---- 会话身份 ----
+    session_id: str          # 同时是 LangGraph thread_id
+    job_id: str
+    marker: str
+    user_id: str
 
-    # 输入
-    prompt: str
+    # ---- 用户输入 ----
+    user_input: str
+    attachments: list        # hydrate 后，每项含 parsed: {columns, rows, row_count}
+    datasources: list
 
-    # Analyzer 产出
-    requirements: str       # 结构化需求：功能列表、交互要点
+    # ---- agent 产出 ----
+    intent: dict | None              # router: {intent, confidence, extracted_info}
+    requirement_doc: str | None      # analyst: 确认摘要（挂起时是完整 markdown）
+    analysis_output: dict | None     # analyst: {_format,_content,confidence_score,confirmation_digest}
+    design_doc: dict | None          # designer: {_format,_content,layout,component_tree,style_tokens}
+    code: str | None
+    code_files: list[dict]           # [{path,content,language,role}]，当前恒 1 个 index.html
+    code_hash: str | None
+    features: list
 
-    # Designer 产出
-    design: str             # 设计方案：布局结构、配色方案、组件清单
+    # ---- Harness 控制 ----
+    pipeline_state: str
+    status: Literal[
+        "routing", "analyzing", "designing", "coding", "verifying", "fixing",
+        "awaiting_confirmation", "completed", "failed", "completed_with_warnings",
+    ]
+    gate_reports: list[dict]
+    contract_errors: list[dict]
+    verification_result: dict | None
 
-    # Coder 产出
-    html: str               # 生成的 HTML 页面
+    # ---- 修复循环 ----
+    fix_round: int
+    max_fix_rounds: int
+    fix_history: list[dict]
+    repair_strategy: str
 
-    # Verifier 产出
-    verified: bool          # 是否通过验证
-    verify_message: str     # 验证结论或错误描述
+    # ---- 多轮（Step 8 起真正使用）----
+    messages: Annotated[list[AnyMessage], add_messages]
+    history_messages: list[dict]
+    user_confirmed: bool | None
+    iteration_feedback: str | None
 
-    # Phase 4 新增：Harness 控制字段
-    iteration: int  # 当前修复迭代次数（从 0 开始）
-    max_iterations: int  # 最大允许修复次数（默认 3）
-    """
-    gate_decision生命周期：
-    analyze → gate_analyze 写入 {"gate_decision": "proceed"}
-         → design 执行（gate_decision 还是 "proceed"，没人改它）
-         → gate_design 写入 {"gate_decision": "proceed"}  ← 覆盖上一次的值
-         → code 执行（gate_decision 还是 "proceed"）
-         → gate_code 写入 {"gate_decision": "fix"}        ← 覆盖
-         → fix 执行（gate_decision 还是 "fix"，没人改它）
-    因为条件边只在紧跟着的 gate_xxx 节点执行后立刻读取 gate_decision，读到的就是刚刚写入的最新值。
-    业务节点（analyze / design / code 等）本身不读 gate_decision，所以它里面残留什么值都无所谓。
-    
-    唯一要注意的地方是 fix 节点：它执行完之后直接走 → code，而不经过任何 gate。
-    这时 gate_decision 还是 gate_code 上次写的 "fix"，
-    但没关系——code 执行完之后会立刻走 gate_code，gate_code 会用新的 html 重新评估并覆盖写入新的 gate_decision。
-    """
-
-    gate_decision: str  # 当前门禁决策（proceed/retry/fix/block）
-
-    # Phase 5 新增：hydrate 后的附件列表，每项含完整 parsed 数据
-    # 结构：[{"file_id": str, "filename": str, "columns": [...],
-    #          "parsed": {"columns": [...], "rows": [...], "row_count": int}}]
-    # Runner 负责从本地文件加载 parsed，agent 按需读取，不做截断由 agent 自决。
-    attachments: list
-
-    # Phase 5 Step4 新增：会话身份，供 coder 等 agent 内部发事件使用
-    session_id: str   # 生成任务的会话 ID，和 LangGraph thread_id 相同
-    marker: str       # 页面标识（生成任务的唯一标记）
-    user_id: str      # 发起任务的用户 ID
+    # ---- 模板 / Skill / 知识库（Step 11、12 起使用，本 Step 占位）----
+    template_id: str | None
+    template_code: str | None
+    skill_context: dict | None
+    knowledge_context: dict | None
+    external_knowledge: str | None
+    force_auto_confirm: bool | None

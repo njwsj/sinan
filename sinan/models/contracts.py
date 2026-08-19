@@ -1,67 +1,187 @@
 # sinan/models/contracts.py
+"""流水线各步骤的结构化契约模型。
+
+对齐参考 page/models/contracts.py：每个 PipelineState 有一个输出契约，
+harness/contracts.py 的 ContractValidator 按步骤取契约做 model_validate，
+校验失败不抛异常，而是把错误写进 state["contract_errors"] 供后续排查。
+
+与 Step 6 之前的差异：原先只有 AnalyzeContract/DesignContract/CodeContract/VerifyContract
+四个「字符串长度 + doctype」级别的弱契约，且校验逻辑写在契约的 validate_content() 里由
+gates.py 调用。Step 7 起改为参考的结构化契约，弱契约整体删除。
+"""
+from __future__ import annotations
+
 from pydantic import AliasChoices, BaseModel, Field
-from typing import List
-
-"""
-Pydantic 契约模型用来约束每个 Agent 的输出格式。
-例如 Analyzer 必须输出某些关键字段，Coder 输出的 HTML 至少要有 100 个字符。这样一旦 LLM 输出偏轨，Pydantic 校验就会报错，触发重试而不是把垃圾数据传给下一步。
-
-每个契约类统一提供 `validate_content()` 方法，封装该步骤的业务校验规则，返回错误列表。
-门禁引擎（gates.py）调用这个方法，只负责根据结果做路由决策，不自己实现校验逻辑。
-"""
 
 
-class AnalyzeContract(BaseModel):
-    """Analyzer 输出契约：结构化需求描述必须包含这些核心字段。"""
-    requirements: str = Field(..., min_length=20,
-                              description="结构化需求清单，至少 20 个字符")
+# ─── Step 1: Ingestion ───────────────────────────────
+class DataSourceConfig(BaseModel):
+    """数据源配置。type: api / static / database / file。"""
 
-    def validate_content(self) -> List[str]:
-        """业务内容校验，返回错误列表（空列表 = 通过）。"""
-        errors = []
-        # Pydantic 的 min_length 已保证长度，这里可追加更多业务规则
-        # 例如：要求包含"功能"或"数据"等关键词（按需开启）
-        return errors
+    type: str
+    endpoint: str | None = None
+    schema_url: str | None = None
+    sample_data: dict | None = None
 
 
-class DesignContract(BaseModel):
-    """Designer 输出契约：设计方案必须包含布局和配色描述。"""
-    design: str = Field(..., min_length=20,
-                        description="页面设计方案，至少 20 个字符")
+class IngestionInput(BaseModel):
+    """摄取步骤的原始输入。"""
 
-    def validate_content(self) -> List[str]:
-        """业务内容校验，返回错误列表（空列表 = 通过）。"""
-        errors = []
-        # 例如：要求包含布局或配色关键词（按需开启）
-        return errors
+    raw_requirement: str = Field(..., min_length=10, max_length=10000)
+    data_sources: list[DataSourceConfig] = Field(default_factory=list)
+    constraints: dict = Field(default_factory=dict)
 
 
-class CodeContract(BaseModel):
-    """Coder 输出契约：生成的 HTML 必须满足最低结构要求。"""
-    html: str = Field(..., min_length=100, description="生成的 HTML，至少 100 字符")
+class NormalizedRequirement(BaseModel):
+    """归一化后的需求。page_type: dashboard / report / analysis / custom。"""
 
-    def validate_content(self) -> List[str]:
-        """HTML 结构校验，返回错误列表（空列表 = 通过）。"""
-        errors = []
-        html_lower = self.html.lower()
-        if "<!doctype" not in html_lower[:200]:
-            errors.append("缺少 <!DOCTYPE html>")
-        if "<html" not in html_lower:
-            errors.append("缺少 <html> 标签")
-        if "<body" not in html_lower:
-            errors.append("缺少 <body> 标签")
-        return errors
+    title: str
+    description: str
+    page_type: str
+    target_platform: str = "pc"
+    features: list[str] = Field(default_factory=list)
+    data_fields: list[dict] = Field(default_factory=list)
 
 
-class VerifyContract(BaseModel):
-    """Verifier 输出契约：校验结果必须明确给出通过/失败。"""
-    verified: bool
-    verify_message: str = Field(..., min_length=1)
+class IngestionOutput(BaseModel):
+    """摄取步骤输出。"""
 
-    def validate_content(self) -> List[str]:
-        return []
+    requirement: NormalizedRequirement
+    data_schema: dict = Field(default_factory=dict)
+    validation_report: dict = Field(default_factory=dict)
 
+
+# ─── Step 2: Analysis ───────────────────────────────
+class FunctionalModule(BaseModel):
+    """分析阶段识别出的单个功能模块。priority: must / should / nice-to-have。"""
+
+    module_id: str
+    name: str
+    description: str
+    priority: str = "must"
+    data_dependencies: list[str] = Field(default_factory=list)
+    interaction_type: str = "display"
+
+
+class AnalysisOutput(BaseModel):
+    """分析步骤输出。
+
+    注意：参考项目 analyst 实际产出的是 {"_format": "markdown", "_content": ...,
+    "confidence_score": ..., "confirmation_digest": ...}，并不满足 functional_modules
+    的 min_length=1，因此 ANALYSIS 步骤的 contract 校验在参考里是稳定失败并被记进
+    contract_errors 的（不阻断流程）。sinan 保持同样行为以对齐黑盒表现。
+    """
+
+    template_analysis: dict = Field(default_factory=dict)
+    functional_modules: list[FunctionalModule] = Field(min_length=1)
+    data_plan: dict = Field(default_factory=dict)
+    style_profile: dict = Field(default_factory=dict)
+    confirmation_digest: str
+    confidence_score: float = Field(ge=0.0, le=1.0)
+
+
+# ─── Step 3: Design ───────────────────────────────
+class ComponentNode(BaseModel):
+    """递归组件树节点。"""
+
+    component_id: str
+    component_type: str
+    props: dict = Field(default_factory=dict)
+    data_binding: dict | None = None
+    children: list["ComponentNode"] = Field(default_factory=list)
+
+
+ComponentNode.model_rebuild()
+
+
+class DesignOutput(BaseModel):
+    """设计步骤输出。"""
+
+    layout: dict
+    component_tree: ComponentNode
+    interactions: list[dict] = Field(default_factory=list)
+    data_bindings: list[dict] = Field(default_factory=list)
+    style_tokens: dict = Field(default_factory=dict)
+
+
+# ─── Step 4: Generation ───────────────────────────────
+class CodeFile(BaseModel):
+    """单个生成文件。role: component / style / logic / entry。"""
+
+    path: str
+    content: str
+    language: str = "html"
+    role: str = "entry"
+
+
+class GenerationOutput(BaseModel):
+    """代码生成步骤输出。当前实际只产出单文件 index.html。"""
+
+    files: list[CodeFile] = Field(min_length=1)
+    entry_point: str = "index.html"
+    dependencies: list[dict] = Field(default_factory=list)
+
+
+# ─── Step 5: Validation ───────────────────────────────
+class ValidationIssue(BaseModel):
+    """单条验证问题。所有 validator 统一输出这个结构。"""
+
+    issue_id: str
+    severity: str          # P0 / P1 / P2
+    category: str          # requirement / template / data / syntax / render / ...
+    description: str
+    location: str | None = None
+    suggestion: str | None = None
+
+
+def compute_quality_score(issues: list["ValidationIssue"]) -> float:
+    """由问题列表计算 [0.0, 1.0] 的质量分。
+
+    扣分权重（对齐参考 page/models/contracts.py:122）：
+      P0 → 0.30（阻断）
+      P1 → 0.10（显著）
+      P2 → 0.02（轻微）
+    多条累加，下限截断到 0.0。
+    """
+    _PENALTIES: dict[str, float] = {"P0": 0.30, "P1": 0.10, "P2": 0.02}
+    penalty = sum(_PENALTIES.get(i.severity, 0.0) for i in issues)
+    return max(0.0, round(1.0 - penalty, 2))
+
+
+class RepairRecord(BaseModel):
+    """单轮修复记录。"""
+
+    round: int
+    issues_found: list[ValidationIssue] = Field(default_factory=list)
+    issues_resolved: list[str] = Field(default_factory=list)
+    issues_remaining: list[str] = Field(default_factory=list)
+
+
+class ValidationOutput(BaseModel):
+    """最终验证结果 + 修复历史。"""
+
+    passed: bool
+    total_rounds: int = Field(ge=1, le=3)
+    final_code: GenerationOutput | None = None
+    repair_history: list[RepairRecord] = Field(default_factory=list)
+    quality_score: float = Field(ge=0.0, le=1.0)
+
+
+# ─── Step 7: Iteration ───────────────────────────────
+class RouteDecision(BaseModel):
+    """迭代路由决策：修改请求应该从哪个步骤重新进入流水线（Step 8 使用）。"""
+
+    target_step: str        # design / generation
+    reason: str
+    change_scope: str       # structural / partial
+    affected_modules: list[str] = Field(default_factory=list)
+    preserved_modules: list[str] = Field(default_factory=list)
+
+
+# ─── API Request/Response ───────────────────────────
 class GenerateRequest(BaseModel):
+    """页面生成请求体（Step 1 已对齐参考，本 Step 不变）。"""
+
     prompt: str = Field(..., min_length=2)
     session_id: str | None = None
     marker: str | None = None

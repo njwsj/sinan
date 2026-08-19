@@ -167,6 +167,23 @@ class GenerationJobStore:
         """将 Job 标记为失败（FAILED），并记录错误信息（截断至 4000 字符）。仅持有租约的 owner 可操作。"""
         await self._mark_terminal(job_id, FAILED, owner=owner, error_message=(error_message or "")[:4000])
 
+    async def mark_waiting(self, job_id: str, owner: str) -> bool:
+        """running → waiting：等待用户确认。清空租约后，run_job 的 mark_completed
+        （where lease_owner == owner）命中 0 行，挂起 Job 不会被误置 completed。"""
+        now = datetime.now()
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                update(GenerationJob)
+                .where(
+                    GenerationJob.job_id == job_id,
+                    GenerationJob.lease_owner == owner,
+                    GenerationJob.status == RUNNING,
+                )
+                .values(status=WAITING, lease_owner=None, lease_until=None, updated_at=now)
+            )
+            await db.commit()
+            return result.rowcount > 0
+
     async def request_cancel(self, *, job_id: str | None = None, session_id: str | None = None) -> None:
         """外部取消：把匹配的活动 Job 置 cancelled 并清租约。运行中 worker 在 finalize 前复查状态不会再置 completed。"""
         now = datetime.now()

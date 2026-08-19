@@ -1,0 +1,84 @@
+一.新增：
+	/harness/validators：新增的五个文件都被verifier所用
+		data.py:校验页面数据来源与变量引用正确性。
+		render.py:渲染校验：Playwright 加载页面，采集 JS 运行时错误。
+		requirement.py:需求一致性校验：生成代码是否落实了需求分析里的要求。
+		syntax.py:JS 语法校验：对每个 <script> 块跑 `node --check`。
+		tmplate.py:模板一致性校验：仅在 state["template_code"] 存在时生效（Step 11 起才有真实模板）。
+	/harness/
+		contracts.py:契约校验器：按 PipelineState 取输出契约做校验。
+			validate_output:
+				从model/contracts.py中取出流水线中的各种结构化契约模型（基于oydantic）
+				如果有错误的话/找不到对应的契约模型，返回ContractViolation，便于在orchestrator中判断是不是有错误
+
+		orchestrator.py:节点装饰器：契约校验 + 门禁评估 + 产物落库。其实有点像springAOP，在节点执行完之后 执行一系列的操作
+			_validate_contract：
+				判断当前步骤->获取当前的输出数据->调用上面的contracts.validate_output进行契约校验
+			_evaluate_gate：
+				判断当前步骤->解析出当前的步骤的字段放进obj->调用_gate_engine.evaluate(step, obj, {"state": state})->进入gate.py会根据不同的步骤返回不同的GateResult -> 返回供下一步使用
+			_persist
+				将前两步的result持久化
+	/agent/
+		router.py：增加意图判断节点
+
+二、修改：
+	/agents：
+		analyzer.py：
+			修改提示词，会在末尾生成一个META_JSON：{"confidence_score": 0.0-1.0, "confirmation_digest": "一句话摘要", "page_sections_count": 数字, "fields_count": 数字}
+		coder.py:
+			修改提示词
+			返回字段加入code_hash和code_files
+					门禁（gates.py）在 GENERATION 阶段需要对代码做指纹校验，用来判断修复前后内容是否发生了变化。用 SHA-256 对 HTML 内容做摘要，是最直接的方式。
+					code_files是把生成的html文件包装成了
+						"code_files": 	[
+										    {
+										        "path": "index.html",
+										        "content": "<html>...实际生成的代码...</html>",
+										        "language": "html",
+										        "role": "entry"
+										    }
+										]
+						契约设计时考虑的是多文件场景（比如 index.html + style.css + app.js），所以用列表来存。但 coder 现在实际上只生成一个文件，所以就手动把那一个文件放进列表，假装自己是"只有一个元素的多文件输出"，让契约校验能通过。
+		designer.py：
+			修改提示词
+		fixer.oy:
+			将传给llm的字段扩充
+
+		graph.py:
+			去掉多余的节点 使用orchestrator中的节点包装器
+		state.py:
+			增加字段
+		verifier.py：
+			重构，使用/harness/validators目录下的五个校验
+
+三、现阶段请求流程：
+	POST /api/page/generate
+       ↓
+	GenerationRunner.run_job → 抢租约
+	       ↓
+	astream_events({user_input, fix_round=0, gate_reports=[], ...})
+	       ↓
+	router.run → wrap_node(INGESTION) → intent → 门禁（schema）→ 落库
+	       ↓
+	analyst.run → 流式推 analysis_delta → parse_analyst_response
+	   [confidence < 0.3?] → END(awaiting_confirmation) → runner 挂起 Job / 发事件
+	   [confidence >= 0.3?] → wrap_node(ANALYSIS) → analysis_output → 门禁（user_confirmation）→ 落库
+	       ↓
+	designer.run → 流式推 design_delta → parse_designer_response
+	            → wrap_node(DESIGN) → design_doc → 门禁（design_completeness）→ 落库
+	       ↓
+	coder.run → 流式推 code_delta → 返回 code + code_hash + code_files
+	          → wrap_node(GENERATION) → 门禁（syntax_integrity）→ 落库
+	       ↓
+	verifier.run → 5 个 validator → verification_result(passed/issues/quality_score)
+	             → wrap_node(VALIDATION) → 门禁（quality_threshold）→ 落 artifact
+	       ↓
+	[_should_fix]
+	  passed → END(complete) → runner 发 verify_result + completed，落 page_version
+	  fix_round >= max_rounds → END(complete_with_warnings) → runner 抛 ValueError → Job failed
+	  否则 →
+	       ↓
+	fixer.run → 发 fix_start → LLM 修复 → 追加 fix_history → 发 fix_applied → 返回新 code
+	       ↓
+	→ 回 verifier (fix_round+1)
+		

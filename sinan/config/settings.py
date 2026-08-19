@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     job_lease_seconds: int = 60
     event_retention_seconds: int = 3600
 
+    # --- Pipeline / Harness（Step 7）---
+    auto_confirm_threshold: float = 0.3   # 参考 page/config/dev.config:42
+    max_fix_rounds: int = 3               # 参考 page/config/settings.py:63
+    quality_threshold: float = 0.8        # 参考 page/harness/gates.py:113 硬编码值
+    render_validation_enabled: bool = False   # Step 15 对照前必须置 True
+    render_validation_timeout: int = 20
+
     @property
     def database_url(self) -> str:
         return (

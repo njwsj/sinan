@@ -40,16 +40,40 @@
 |---|---|---|---|---|---|---|
 | `session_init` | session_id, marker, resume_cursor | 是 | 是 | 否 | 否 | `api/routes/generate.py` |
 | `step` | step, message, agent | 是 | 是 | 否 | 否 | `services/generation_runner.py` |
+| `analysis_delta` | delta, accumulated_len | 是 | 是 | 否 | 否 | `agents/analyzer.py` |
+| `analysis_result` | content | 是 | 是 | 否 | 否 | `agents/analyzer.py` |
+| `design_delta` | delta, accumulated_len | 是 | 是 | 否 | 否 | `agents/designer.py` |
+| `design_result` | content | 是 | 是 | 否 | 否 | `agents/designer.py` |
 | `code_start` | phase, round | 是 | 是 | 否 | 否 | `agents/coder.py` |
 | `code_delta` | delta, accumulated_len, phase | 是 | 是 | 否 | 否 | `agents/coder.py` |
 | `code_stream_end` | phase, accumulated_len, round | 是 | 是 | 否 | 否 | `agents/coder.py` |
 | `verify_result` | passed, quality_score, issues, round, message | 是 | 是 | 否 | 否 | `services/generation_runner.py` |
-| `fix_applied` | round, strategy, fixed_count | 是 | 是 | 否 | 否 | `services/generation_runner.py` |
+| `fix_start` | round, strategy, issue_count | 是 | 是 | 否 | 否 | `agents/fixer.py`（Step 7 起） |
+| `fix_applied` | round, strategy, fixed_count | 是 | 是 | 否 | 否 | `agents/fixer.py`（Step 7 起，原在 runner） |
+| `awaiting_confirmation` | message, confirmation_digest, requirement_doc | 是 | 是 | 是 | → PAUSED | `services/generation_runner.py`（Step 7 起） |
 | `completed` | version, preview_url, quality_score, message | 是 | 是 | 是 | → COMPLETED | `services/generation_runner.py` |
 | `error` | message, code | 是 | 是 | 是 | → FAILED | `services/generation_runner.py` |
 | `cancelled` | message | 是 | 是 | 是 | → FAILED（Step 6 换 CANCELLED） | `services/generation_runner.py` |
 
-已定义常量与 data 构造器、但本 Step 尚无发布点的事件：`gate_passed`、`code_snapshot`、`verify_start`、`fix_start`（Step 7），`awaiting_confirmation`、`chat`（Step 8），`skill_running`、`skill_result`、`knowledge_source`（Step 12）。协议先固化，避免后续各处手写字段漂移。
+已定义常量与 data 构造器、但仍无发布点的事件：`code_snapshot`、`verify_start`（Step 15 补），`chat`（Step 8），`skill_running`、`skill_result`、`knowledge_source`（Step 12）。`gate_passed` 见下方说明。
+
+## Step 7 变更
+
+- **`step` 事件的 `step` / `agent` 取值变了**（前端需同步）：由 `analyze / design / code / verify / fix`
+  改为 `router / analyst / designer / coder / verifier / fixer`，与参考节点名一致
+  （`services/generation_runner.py` 的 `step_labels`）。按 `step` 值做 UI 分支的地方会失配。
+- `completed.quality_score` 与 `verify_result.quality_score` 自 Step 7 起为真值，由
+  `models/contracts.compute_quality_score(issues)` 计算：P0=0.30 / P1=0.10 / P2=0.02 累加，
+  `round(1 - penalty, 2)`，下限 0.0。`verify_result.issues` 是 `ValidationIssue.model_dump()`
+  列表（issue_id / severity / category / description / location / suggestion）。
+- `fix_start` / `fix_applied` 的发布点改为 `agents/fixer.py`，每轮修复各发一条。
+  **这是 sinan 增量**：参考的 native pipeline（`page/agents/fixer.py`）不发任何事件，
+  这两个事件只在 claude_code / opencode 运行时里发（`page/claude_code/codegen_engine.py:1240,1250`）。
+  原先 runner 在图跑完后补发的那条 `fix_applied` 已移除，避免重复。
+  另注：`fix_applied.fixed_count` 实际传的是"本轮修复前的问题数"，不是真正修好的数量（参考亦无真实计数）。
+- `awaiting_confirmation` 自 Step 7 起有发布点，payload 为 `{message, confirmation_digest, requirement_doc}`，
+  同时 Session 落 `paused` + `pipeline_state=user_confirm`，Job 落 `waiting`。
+- `gate_passed` 仍无发布点：参考不发 gate 事件，门禁报告只落 `gen_session.gate_reports`（Text 列，JSON 文本）。sinan 保持一致，不擅自新增事件。
 
 ## 已对齐
 
@@ -63,8 +87,9 @@
 ## 未对齐（待后续 Step 或待黑盒确认）
 
 - 取消事件名不同：参考用 `event="error"` 承载取消，sinan 用独立的 `cancelled`。需按前端实际契约二选一。
-- `completed.quality_score` 与 `verify_result.quality_score` 当前恒为 `0.0`：`PageGenState` 无该字段，取值待 Step 7 扩展 gates/verifier 后补齐。
 - `session_init.resume_cursor` 当前恒为空字符串（真实游标通过 `data.cursor` 下发，`event_id` 记在服务端日志）。该字段是否保留待前端确认。
 - 参考侧 `started`、`analysis_start`、`analysis_end`、`design_start`、`design_end`、`artifact_ready` 等事件名尚未逐一核对，需从一次真实生成的完整 SSE 原文确认后再决定是否与 sinan 的 `step` 合并。
 - `code_delta` 逐 token 落 Redis（INCR + RPUSH + LTRIM），与参考同构但 QPS 放大明显。若压测出现瓶颈，优化方向是在 coder 侧按字符数或时间窗聚合 delta，而不是绕过持久化。
+- `analysis_delta` / `design_delta` 是 sinan 的流式增量（参考 analyst/designer 用非流式 `ainvoke`，只有最终文本）。事件协议自 Step 5 固化，不回退，但对照时参考侧不会有这两类事件。
+- `verify_result.issues` 的条目数与内容取决于是否开启渲染校验：`render_validation_enabled` 默认 False，且 sinan 未接 Vision LLM 视觉检查（参考 `page/harness/validators/render.py` 有 28 项视觉检查）。因此 sinan 侧 issue 更少、修复轮数更少、`quality_score` 系统性偏高。Step 15 对照前必须先统一这两项。
 - 事件完整顺序尚未做双项目对照回归（Step 15）。

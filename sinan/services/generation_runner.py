@@ -52,7 +52,7 @@ class GenerationRunner:
         await session_store.update(
             session_id,
             status=SessionStatus.ACTIVE.value,
-            pipeline_state=PipelineState.ANALYSIS.value,
+            pipeline_state=PipelineState.INIT.value,
         )
         await cancel_registry.clear_async(session_id)
 
@@ -79,24 +79,32 @@ class GenerationRunner:
             # attachments 作为结构化数据传入 state，由 analyzer/coder 各自按需读取
 
             step_labels = {
-                "analyze": "正在分析需求...",
-                "design": "正在制定设计方案...",
-                "code": "AI 正在生成页面代码...",
-                "fix": "正在修复问题...",
-                "verify": "正在验证页面...",
+                "router": "正在识别需求意图...",
+                "analyst": "正在分析需求...",
+                "designer": "正在制定设计方案...",
+                "coder": "AI 正在生成页面代码...",
+                "verifier": "正在验证页面...",
+                "fixer": "正在修复问题...",
             }
             final_state = None
             async for event in self.graph.astream_events(
                     {
-                        "prompt": prompt,
-                        "attachments": hydrated,
-                        "iteration": 0,
-                        "max_iterations": 3,
-                        "session_id": session_id,  # 新增
+                        "session_id": session_id,
+                        "job_id": job.job_id,
                         "marker": resolved_marker,
-                        "user_id": session.user_id if session else "system",  # 新增
+                        "user_id": session.user_id if session else "system",
+                        "user_input": prompt,
+                        "attachments": hydrated,
+                        "datasources": payload.get("datasources") or [],
+                        "template_id": payload.get("template_id"),
+                        "fix_round": 0,
+                        "max_fix_rounds": settings.max_fix_rounds,
+                        "gate_reports": [],
+                        "contract_errors": [],
+                        "fix_history": [],
+                        "pipeline_state": PipelineState.INIT.value,
+                        "status": "routing",
                     },
-                    # 这个config参数必须要传，每个 session_id 对应一个独立的 LangGraph thread，它们的 checkpoint 数据互不干扰，但底层都共享同一个进程和事件循环。
                     config={"configurable": {"thread_id": session_id}},
                     version="v2",
             ):
@@ -136,43 +144,58 @@ class GenerationRunner:
                     if event.get("run_id") and name == "LangGraph":
                         final_state = event["data"].get("output")
 
-            # 如果经历了修复，推送修复事件
-            iteration = final_state.get("iteration", 0)
-            if iteration > 0:
+            # fix_start / fix_applied 现在由 fixer 节点内部按轮发布，
+            # runner 不再事后补发，否则同一轮会出现两条 fix_applied。
+            fix_round = final_state.get("fix_round", 0)
+            verification = final_state.get("verification_result") or {}
+            quality_score = float(verification.get("quality_score") or 0.0)
+            issues = verification.get("issues") or []
+
+            # 低置信度挂起：图在 analyst 之后就 END 了，没有 code
+            if final_state.get("status") == "awaiting_confirmation":
+                await session_store.update(
+                    session_id,
+                    status=SessionStatus.PAUSED.value,
+                    # sinan 增量：参考 analyst 只写 analysis，session 级 user_confirm 是本项目扩展
+                    pipeline_state=PipelineState.USER_CONFIRM.value,
+                    requirement_doc=final_state.get("requirement_doc") or "",
+                )
                 await event_bus.publish(
-                    session_id, events.FIX_APPLIED,
-                    events.fix_applied_data(iteration, "auto", iteration),
+                    session_id, events.AWAITING_CONFIRMATION,
+                    {
+                        "message": "需求信息不足，请确认后继续",
+                        "confirmation_digest": (final_state.get("analysis_output") or {})
+                            .get("confirmation_digest", ""),
+                        "requirement_doc": final_state.get("requirement_doc") or "",
+                    },
                     job_id=job.job_id, marker=resolved_marker,
                 )
-                await self._write_step(
-                    session_id, "fix",
-                    f"修复完成，共 {final_state['iteration']} 轮",
-                )
+                await generation_job_store.mark_waiting(job.job_id, _OWNER)
+                return   # Job 落 waiting，等 Step 8 的确认接口恢复
 
-            # 验证结果无论是否修复都要推送
-            verify_message = final_state.get("verify_message", "校验完成")
-            await self._write_step(session_id, "verify", verify_message)
+            verify_message = (
+                "校验通过" if verification.get("passed")
+                else "；".join(str(i.get("description", "")) for i in issues[:5]) or "校验未通过"
+            )
+            await self._write_step(session_id, "verifier", verify_message)
             await event_bus.publish(
                 session_id, events.VERIFY_RESULT,
                 {
                     **events.verify_result_data(
-                        passed=bool(final_state.get("verified")),
-                        quality_score=float(final_state.get("quality_score") or 0.0),
-                        issues=final_state.get("issues") or [],
-                        round_num=iteration,
+                        passed=bool(verification.get("passed")),
+                        quality_score=quality_score,
+                        issues=issues,
+                        round_num=fix_round,
                     ),
                     "message": verify_message,
                 },
                 job_id=job.job_id, marker=resolved_marker,
             )
 
-            if not final_state.get("verified"):
-                raise ValueError(
-                    f"验证失败（已修复 {final_state.get('iteration', 0)} 轮）："
-                    f"{final_state.get('verify_message', '未知错误')}"
-                )
+            if not verification.get("passed"):
+                raise ValueError(f"验证失败（已修复 {fix_round} 轮）：{verify_message}")
 
-            html = final_state["html"]
+            html = final_state["code"]
 
         except Exception as e:
             """
@@ -189,7 +212,6 @@ class GenerationRunner:
         # 托管：写 page_version 表，更新 session
         marker = resolved_marker
         version = await page_store.next_version(marker)
-        quality_score = float(final_state.get("quality_score") or 0.0)
         await page_store.save(
             marker=marker,
             version=version,
@@ -198,7 +220,7 @@ class GenerationRunner:
             session_id=session_id,
             title=(session.prompt if session else "")[:128],
             harness_score=quality_score,
-            repair_rounds=iteration,
+            repair_rounds=fix_round,
         )
         # 拼预览 URL（本地开发用 /page/{marker}，生产替换域名）
         preview_url = f"/api/page/preview/{marker}"
@@ -210,7 +232,7 @@ class GenerationRunner:
             marker=marker,
             version=version,
             preview_url=preview_url,
-            fix_rounds=iteration,
+            fix_rounds=fix_round,
             verification_score=quality_score,
         )
 
@@ -220,7 +242,7 @@ class GenerationRunner:
             events.completed_data(
                 version=version,
                 preview_url=preview_url,
-                quality_score=float(final_state.get("quality_score") or 0.0),
+                quality_score=quality_score,
             ),
             job_id=job.job_id, marker=marker,
         )

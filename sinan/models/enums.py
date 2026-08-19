@@ -80,3 +80,34 @@ class PageSource(str, Enum):
     GENERATION = "generation"
     MANUAL = "manual"
     TEMPLATE = "template"
+
+class AgentRole(str, Enum):
+    ROUTER = "router"; ANALYST = "analyst"; DESIGNER = "designer"
+    CODER = "coder"; VERIFIER = "verifier"; FIXER = "fixer"
+
+
+class IssueSeverity(str, Enum):
+    """P0/P1 阻断，P2 不阻断；扣分 0.30/0.10/0.02。"""
+    P0 = "P0"; P1 = "P1"; P2 = "P2"
+
+
+class IssueCategory(str, Enum):
+    """security / a11y 参考也只预留枚举无实现，本 Step 同样不实现。"""
+    REQUIREMENT = "requirement"; TEMPLATE = "template"; DATA = "data"
+    SYNTAX = "syntax"; RENDER = "render"; STYLE = "style"
+    SECURITY = "security"; A11Y = "a11y"
+
+
+class RepairStrategy(str, Enum):
+    CONSERVATIVE = "conservative"; MODERATE = "moderate"; AGGRESSIVE = "aggressive"
+
+
+class ChangeScope(str, Enum):
+    """Step 8 iteration_router 使用，本 Step 只占位。"""
+    STRUCTURAL = "structural"; PARTIAL = "partial"
+
+
+class GateDecision(str, Enum):
+    """sinan 增量：参考用 passed + requires_user 表达。"""
+    PROCEED = "proceed"; RETRY = "retry"; FIX = "fix"
+    BLOCK = "block"; WAIT_USER = "wait_user"

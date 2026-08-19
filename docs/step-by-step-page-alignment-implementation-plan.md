@@ -1,7 +1,7 @@
 # sinan 与原项目 page 百分百对齐：逐 Step 实施方案
 
-本文面向项目 `/Users/zhanghongjia/Documents/work/sinan`，以原项目
-`/Users/zhanghongjia/Documents/project/baidu/gcloud/page` 为行为基准。
+本文面向项目 `/Users/zhanghj/Documents/learn/sinan`，以原项目
+`/Users/zhanghj/Documents/baidu/project/baidu/gcloud/page` 为行为基准。
 
 目标不是让两个项目的文件名完全相同，而是让两边在相同输入下具备一致的：
 
@@ -1409,6 +1409,48 @@ class ValidationIssue(BaseModel):
 - 最终质量分数；
 - 事件顺序；
 - Session 状态。
+
+## 实施结果（Step 7 落地后回填）
+
+实际实现以参考源码为准，与本节原始设计有 4 处出入 —— 原设计比参考**更激进**，照字面实现反而会偏离基线：
+
+1. **7.3 的 13 个节点不存在。** 参考 `page/agents/graph.py:47-61` 只有 6 个节点
+   （router / analyst / designer / coder / verifier / fixer）+ 2 条条件边。
+   `ingestion / analysis / design / generation / validation` 是节点写进 state 的 `pipeline_state`
+   字符串，不是节点；gate 与 contract 校验由 `page/harness/orchestrator.py:wrap_node` 装饰器
+   在每个节点执行后统一跑。因此 sinan 删掉了 `gate_analyze/gate_design/gate_code/gate_verify`
+   四个独立门禁节点，改用 `harness/orchestrator.wrap_node`（5 个业务节点包装，fixer 不包装）。
+   `preview` / `completed` 也不是节点，参考同样没有。
+2. **7.5 的「运行时唯一状态转移来源」参考侧也未实现。** `page/harness/state_machine.py` 的
+   `PipelineStateMachine` 全仓零 import。sinan 只把转移表改成与参考 1:1（11 态、14 条带
+   condition 的三元组），运行时接入记为**两边共同缺口**，留 Step 15，不自造参考没有的强校验。
+3. **7.7 的 `security.py` / `accessibility.py` 本 Step 不建。** 参考只有 5 个 validator
+   （requirement / template / data / syntax / render），`IssueCategory` 里预留了 `security` / `a11y`
+   但无实现。sinan 保持一致。
+4. **`chat` 分支不在图里。** 参考在 API 路由用 `classify_intent` 拦截
+   （`page/api/routes/generate.py:180`），属 Step 8，本 Step 不做。
+
+按 7.6 要求增加的 `decision` 字段是 sinan 增量：参考的门禁报告只有
+`gate/step/passed/score/auto_confirmed/requires_user`（`page/harness/orchestrator.py:119-126`），
+用 `passed + requires_user` 表达决策。sinan 额外输出 `decision/issues/timestamp`，已记入
+`docs/compatibility/state-matrix.md`。
+
+其他与参考的**已知差异**（全部记入兼容矩阵）：
+
+- 无 `harness_checkpoint` 表与 BOS artifact，checkpoint 仍靠 LangGraph `MemorySaver`（Step 9 收口）；
+- `RenderValidator` 只采集 JS 运行时错误，不做参考的 Vision LLM 28 项视觉检查，且
+  `render_validation_enabled` 默认 False —— **Step 15 黑盒对照前必须开启并装 playwright**，
+  否则 sinan 侧 issue 数、修复轮数、`quality_score` 会系统性偏优；
+- `analysis_delta` / `design_delta` 流式事件是 sinan 独有（参考 analyst/designer 非流式）；
+- `fix_start` / `fix_applied` 由 `agents/fixer.py` 每轮发布（参考 native 路径不发这两个事件）；
+- analyst 挂起时 `pipeline_state` 写 `user_confirm`（参考写 `analysis`）；
+- `step` 事件取值改为参考节点名 `router/analyst/designer/coder/verifier/fixer`（前端需同步）。
+
+新增/重写文件：`agents/router.py`、`harness/orchestrator.py`、`harness/contracts.py`、
+`harness/validators/{requirement,template,data,syntax,render}.py`，
+重写 `models/contracts.py`（13 个结构化契约 + `compute_quality_score`）、`agents/state.py`
+（`PageGenState` → `GenerationState`）、五个 agent、`harness/{gates,state_machine}.py`、`agents/graph.py`；
+`generation_job_store` 新增 `mark_waiting()`；`harness/validators/browser_validator.py` 保留但已无引用点。
 
 ---
 

@@ -213,7 +213,12 @@ def verify_start_data(round_num: int) -> dict:
 
 def verify_result_data(passed: bool, quality_score: float,
                        issues: list, round_num: int) -> dict:
-    """验证结果事件。quality_score 当前恒为 0.0，Step 7 扩展 gates 后补真值。"""
+    """验证结果事件。
+
+    Step 7 起 quality_score 为真值，由 models/contracts.compute_quality_score(issues)
+    计算（P0=0.30 / P1=0.10 / P2=0.02 累加，下限 0.0）；
+    issues 是 ValidationIssue.model_dump() 列表。
+    """
     return {"passed": passed, "quality_score": quality_score,
             "issues": issues, "round": round_num}
 
@@ -230,7 +235,7 @@ def fix_applied_data(round_num: int, strategy: str, fixed_count: int) -> dict:
 
 def completed_data(version: int, preview_url: str, quality_score: float,
                    features: list | None = None) -> dict:
-    """生成完成事件。quality_score 当前恒为 0.0，Step 7 扩展后补真值。"""
+    """生成完成事件。Step 7 起 quality_score 为真值（见 verify_result_data）。"""
     d = {"version": version, "preview_url": preview_url,
          "quality_score": quality_score, "message": "页面生成完成"}
     if features:
