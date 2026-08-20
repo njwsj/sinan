@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>Sinan 调试页面</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { display: flex; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f0f2f5; color: #1a1a1a; }
@@ -106,6 +107,27 @@
       white-space: pre-wrap; word-break: break-word; font-size: 13.5px; line-height: 1.75;
       color: #333; font-family: inherit;
     }
+    /* markdown 渲染区 */
+    .content-md {
+      font-size: 14px; line-height: 1.8; color: #333;
+    }
+    .content-md h1,.content-md h2,.content-md h3,.content-md h4 {
+      margin: 1em 0 .4em; font-weight: 600; line-height: 1.4;
+    }
+    .content-md h1 { font-size: 1.5em; border-bottom: 1px solid #eee; padding-bottom: .3em; }
+    .content-md h2 { font-size: 1.25em; border-bottom: 1px solid #f0f0f0; padding-bottom: .2em; }
+    .content-md h3 { font-size: 1.1em; }
+    .content-md p { margin: .5em 0; }
+    .content-md ul,.content-md ol { padding-left: 1.5em; margin: .4em 0; }
+    .content-md li { margin: .2em 0; }
+    .content-md table { border-collapse: collapse; width: 100%; margin: .6em 0; font-size: 13px; }
+    .content-md th,.content-md td { border: 1px solid #e0e0e0; padding: 6px 10px; text-align: left; }
+    .content-md th { background: #f5f5f5; font-weight: 600; }
+    .content-md code { background: #f0f0f0; border-radius: 3px; padding: 1px 5px; font-size: 12.5px; font-family: monospace; }
+    .content-md pre { background: #1e1e2e; border-radius: 6px; padding: 12px; overflow-x: auto; }
+    .content-md pre code { background: none; padding: 0; color: #cdd6f4; font-size: 12.5px; }
+    .content-md blockquote { border-left: 3px solid #d0d0d0; margin: .4em 0; padding: .3em .8em; color: #666; }
+    .content-md strong { font-weight: 600; }
 
     /* 代码 tab */
     #code-wrap {
@@ -177,11 +199,11 @@
   <div id="panels">
     <div class="panel active" id="panel-analysis">
       <div class="panel-placeholder" id="analysis-placeholder">需求分析结果将在这里显示</div>
-      <pre class="content-pre" id="analysis-content" style="display:none"></pre>
+      <div class="content-md" id="analysis-content" style="display:none"></div>
     </div>
     <div class="panel" id="panel-design">
       <div class="panel-placeholder" id="design-placeholder">设计方案将在这里显示</div>
-      <pre class="content-pre" id="design-content" style="display:none"></pre>
+      <div class="content-md" id="design-content" style="display:none"></div>
     </div>
     <div class="panel" id="panel-code">
       <div id="code-len"></div>
@@ -207,10 +229,16 @@
 let currentSessionId = null;
 let currentEventSource = null;
 let codeBuffer = "";
+let analysisMdBuffer = "";  // 缓存流式 markdown 原文，用于实时渲染
+let designMdBuffer = "";
 let isRunning = false;
 // 已上传的附件列表，每项是后端返回的元数据对象
 // { file_id, filename, columns, row_count, preview }
 let uploadedAttachments = [];
+
+const SESSION_STORAGE_KEY = "sinan_session_id";
+const CURSOR_STORAGE_KEY  = "sinan_last_cursor";
+const PROMPT_STORAGE_KEY  = "sinan_last_prompt";
 
 // ── 工具函数 ──
 function addMessage(text, role) {
@@ -271,12 +299,14 @@ function setRunning(flag) {
 // ── 重置 UI ──
 function resetUI() {
   codeBuffer = "";
+  analysisMdBuffer = "";
+  designMdBuffer = "";
   document.getElementById("analysis-placeholder").style.display = "block";
   document.getElementById("analysis-content").style.display = "none";
-  document.getElementById("analysis-content").textContent = "";
+  document.getElementById("analysis-content").innerHTML = "";
   document.getElementById("design-placeholder").style.display = "block";
   document.getElementById("design-content").style.display = "none";
-  document.getElementById("design-content").textContent = "";
+  document.getElementById("design-content").innerHTML = "";
   document.getElementById("code-pre").textContent = "";
   document.getElementById("code-len").textContent = "";
   document.getElementById("code-badge").style.display = "none";
@@ -346,21 +376,32 @@ async function handleFileUpload(file) {
 }
 
 // ── SSE 处理 ──
-function connectSSE(sessionId) {
+function connectSSE(sessionId, cursor) {
   if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
 
-  const url = `/api/page/generate/${sessionId}/stream`;
+  // cursor 为空时从头回放；有 cursor 则从断点续传
+  const cursorParam = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  const url = `/api/page/generate/${sessionId}/stream${cursorParam}`;
   const es = new EventSource(url);
   currentEventSource = es;
 
+  // 每收到任意 SSE 消息，把它的 lastEventId 存起来用于下次恢复
+  const _persistCursor = (e) => {
+    if (e.lastEventId) {
+      sessionStorage.setItem(CURSOR_STORAGE_KEY, e.lastEventId);
+    }
+  };
+
   // 通用：所有 message（无 event 字段时）
   es.addEventListener("session_init", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     setStatus("running", "已连接，等待生成...");
     buildProgressBox();
   });
 
   es.addEventListener("step", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     const stepKey = d.step;
     STEPS.forEach(s => markStep(s.key, ""));
@@ -379,19 +420,23 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("analysis_delta", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
+    analysisMdBuffer += d.delta || "";
     const el = document.getElementById("analysis-content");
-    el.textContent += d.delta || "";
+    el.innerHTML = marked.parse(analysisMdBuffer);
     el.style.display = "block";
     document.getElementById("analysis-placeholder").style.display = "none";
   });
 
   es.addEventListener("analysis_result", e => {
+    _persistCursor(e);
     // 断线重连后用完整内容直接填充（流式已经显示的情况下跳过）
     const el = document.getElementById("analysis-content");
-    if (!el.textContent) {
+    if (!analysisMdBuffer) {
       const d = JSON.parse(e.data);
-      el.textContent = d.content || "";
+      analysisMdBuffer = d.content || "";
+      el.innerHTML = marked.parse(analysisMdBuffer);
       el.style.display = "block";
       document.getElementById("analysis-placeholder").style.display = "none";
     }
@@ -399,25 +444,30 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("design_delta", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
+    designMdBuffer += d.delta || "";
     const el = document.getElementById("design-content");
-    el.textContent += d.delta || "";
+    el.innerHTML = marked.parse(designMdBuffer);
     el.style.display = "block";
     document.getElementById("design-placeholder").style.display = "none";
   });
 
   es.addEventListener("design_result", e => {
+    _persistCursor(e);
     // 断线重连后用完整内容直接填充
     const el = document.getElementById("design-content");
-    if (!el.textContent) {
+    if (!designMdBuffer) {
       const d = JSON.parse(e.data);
-      el.textContent = d.content || "";
+      designMdBuffer = d.content || "";
+      el.innerHTML = marked.parse(designMdBuffer);
       el.style.display = "block";
       document.getElementById("design-placeholder").style.display = "none";
     }
   });
 
   es.addEventListener("code_start", e => {
+    _persistCursor(e);
     codeBuffer = "";
     document.getElementById("code-pre").textContent = "";
     document.getElementById("code-len").textContent = "";
@@ -425,6 +475,7 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("code_delta", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     codeBuffer += d.delta || "";
     document.getElementById("code-pre").textContent = codeBuffer;
@@ -435,6 +486,7 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("code_stream_end", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     const badge = document.getElementById("code-badge");
     badge.textContent = (d.accumulated_len / 1000).toFixed(1) + "k";
@@ -442,11 +494,13 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("verify_start", e => {
+    _persistCursor(e);
     activateTab("verify");
     document.getElementById("verify-placeholder").textContent = "验证中...";
   });
 
   es.addEventListener("verify_result", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     const box = document.getElementById("verify-content");
     box.style.display = "block";
@@ -520,16 +574,19 @@ function connectSSE(sessionId) {
   });
 
   es.addEventListener("fix_applied", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     markStep("fix", "done");
     addMessage(`自动修复完成（第 ${d.round} 轮）`, "assistant");
   });
 
   es.addEventListener("gate_passed", e => {
+    _persistCursor(e);
     // 静默处理
   });
 
   es.addEventListener("completed", e => {
+    _persistCursor(e);
     const d = JSON.parse(e.data);
     setStatus("done", `生成完成（版本 ${d.version}）`);
     STEPS.forEach(s => markStep(s.key, "done"));
@@ -544,22 +601,35 @@ function connectSSE(sessionId) {
     activateTab("preview");
     setRunning(false);
     es.close();
+    // 生成完成后清掉 session 恢复信息，下次发送是全新会话
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(CURSOR_STORAGE_KEY);
   });
 
   es.addEventListener("error", e => {
+    _persistCursor(e);
+    // 只有后端推送了 event: error 消息（e.data 有内容）才算真正的生成失败
+    // 网络断开/刷新导致的连接中断不带 data，不清除 session 恢复信息
+    if (!e.data) return;
     let msg = "生成失败";
     try { const d = JSON.parse(e.data); msg = d.message || msg; } catch (_) {}
     setStatus("error", msg);
     addMessage("错误：" + msg, "assistant");
     setRunning(false);
     es.close();
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(CURSOR_STORAGE_KEY);
+    sessionStorage.removeItem(PROMPT_STORAGE_KEY);
   });
 
   es.addEventListener("cancelled", e => {
+    _persistCursor(e);
     setStatus("", "已取消");
     addMessage("生成已取消", "assistant");
     setRunning(false);
     es.close();
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(CURSOR_STORAGE_KEY);
   });
 
   es.onerror = err => {
@@ -580,8 +650,11 @@ async function sendPrompt() {
   setRunning(true);
   setStatus("running", "正在提交...");
 
-  // 每次发送都新建 session
+  // 新会话：清掉旧的恢复信息
   currentSessionId = null;
+  sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  sessionStorage.removeItem(CURSOR_STORAGE_KEY);
+  sessionStorage.removeItem(PROMPT_STORAGE_KEY);
 
   try {
     const legacyRes = await fetch("/api/v1/generate", {
@@ -603,7 +676,10 @@ async function sendPrompt() {
     }
     const data = await legacyRes.json();
     currentSessionId = data.session_id;
-    connectSSE(currentSessionId);
+    // 持久化 session_id 和 prompt，以便刷新/后退后用 POST 带 session_id 重连
+    sessionStorage.setItem(SESSION_STORAGE_KEY, currentSessionId);
+    sessionStorage.setItem(PROMPT_STORAGE_KEY, prompt);
+    connectSSE(currentSessionId, null);
   } catch (err) {
     setStatus("error", "请求失败");
     addMessage("请求失败：" + err.message, "assistant");
@@ -615,6 +691,70 @@ async function sendPrompt() {
 async function cancelGeneration() {
   if (!currentSessionId) return;
   await fetch(`/api/page/generate/${currentSessionId}/cancel`, { method: "POST" });
+}
+
+// ── 页面加载时：检测并恢复未完成的 session ──
+async function tryResumeSession() {
+  const savedSessionId = sessionStorage.getItem(SESSION_STORAGE_KEY);
+  const savedCursor    = sessionStorage.getItem(CURSOR_STORAGE_KEY);
+  const savedPrompt    = sessionStorage.getItem(PROMPT_STORAGE_KEY);
+  if (!savedSessionId || !savedPrompt) return;
+
+  // 先查 session 状态，只有未完成的才恢复
+  let sessionInfo;
+  try {
+    const r = await fetch(`/api/page/session/${savedSessionId}`);
+    if (r.status === 404) {
+      // session 不存在，清掉本地记录，不新建任务
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
+      sessionStorage.removeItem(CURSOR_STORAGE_KEY);
+      sessionStorage.removeItem(PROMPT_STORAGE_KEY);
+      return;
+    }
+    if (!r.ok) {
+      // 其他错误（500等），放弃本次恢复但保留 key，下次刷新再试
+      console.warn("tryResumeSession: session query failed", r.status);
+      return;
+    }
+    sessionInfo = await r.json();
+  } catch (err) {
+    // 网络错误，放弃本次恢复但保留 key
+    console.warn("tryResumeSession: network error", err);
+    return;
+  }
+
+  // 已完成的 session 不需要恢复
+  if (sessionInfo.status === "completed" || sessionInfo.status === "failed") {
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(CURSOR_STORAGE_KEY);
+    sessionStorage.removeItem(PROMPT_STORAGE_KEY);
+    return;
+  }
+
+  // session 仍活跃：POST 带 session_id 重连，触发 create_or_reuse
+  currentSessionId = savedSessionId;
+  setRunning(true);
+  setStatus("running", "正在恢复上次会话...");
+  buildProgressBox();
+  addMessage("检测到未完成的会话，正在重连...", "assistant");
+
+  try {
+    const res = await fetch("/api/v1/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: savedPrompt, session_id: savedSessionId }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+  } catch (err) {
+    addMessage("重连失败：" + err.message, "assistant");
+    setRunning(false);
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(CURSOR_STORAGE_KEY);
+    sessionStorage.removeItem(PROMPT_STORAGE_KEY);
+    return;
+  }
+
+  connectSSE(savedSessionId, null);
 }
 
 // ── 事件绑定 ──
@@ -630,6 +770,9 @@ document.getElementById("upload-file-input").addEventListener("change", e => {
 document.querySelectorAll(".tab").forEach(tab => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
 });
+
+// DOM 和事件绑定全部完成后再尝试恢复 session
+tryResumeSession();
 </script>
 </body>
 </html>

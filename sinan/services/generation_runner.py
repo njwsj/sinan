@@ -177,7 +177,6 @@ class GenerationRunner:
                 "校验通过" if verification.get("passed")
                 else "；".join(str(i.get("description", "")) for i in issues[:5]) or "校验未通过"
             )
-            await self._write_step(session_id, "verifier", verify_message)
             await event_bus.publish(
                 session_id, events.VERIFY_RESULT,
                 {

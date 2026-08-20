@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
     from sinan.services.redis import create_redis
     create_redis()
     from sinan.services.generation_supervisor import start_supervisor, stop_supervisor
-    # await start_supervisor()
+    await start_supervisor()
     yield
     # 服务器关闭时：在此处添加清理逻辑
     """

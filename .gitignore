@@ -41,5 +41,4 @@ htmlcov/
 
 # hatch
 .hatch/
-/logs/sinan.log.2026-08-17
-/logs/sinan-access.log.2026-08-17
+/logs/
