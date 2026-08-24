@@ -65,6 +65,28 @@ class GenerationJobStore:
             await db.refresh(job)
             return JobCreateResult(job=job, created=True)
 
+    async def create_action_job(
+            self, *, action: str, session_id: str, marker: str, user_id: str, body: dict
+    ) -> JobCreateResult:
+        """为 confirm/iterate/resume 建一个新的 Action Job（不复用活动 Job）。
+        payload 里带 action + body，runner 据此选择 confirm 续跑 / iterate 迭代分支。
+        同 session 尚在 waiting 的旧 Job 一并置 cancelled（superseded），避免悬挂。"""
+        now = datetime.now()
+        async with AsyncSessionLocal() as db:
+            # 作废同 session 的 waiting 旧 Job
+            await db.execute(
+                update(GenerationJob)
+                .where(GenerationJob.session_id == session_id, GenerationJob.status == WAITING)
+                .values(status=CANCELLED, lease_owner=None, lease_until=None,
+                        finished_at=now, updated_at=now)
+            )
+            payload = {"action": action, "body": body or {}}
+            job = _new_job(payload, session_id, marker, user_id)
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            return JobCreateResult(job=job, created=True)
+
     async def get_job(self, job_id: str) -> GenerationJob | None:
         """按 job_id 查询单个 Job，不存在时返回 None。"""
         async with AsyncSessionLocal() as db:

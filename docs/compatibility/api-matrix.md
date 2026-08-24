@@ -73,6 +73,23 @@
 | GET | `/api/page/pages/{marker}/versions` | 否（Step 3 加认证） | 桩实现，待 Step 10 填充 | `sinan/api/routes/pages.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
 | POST | `/api/page/upload` | 否（Step 3 加认证） | 桩实现，待 Step 9 填充 | `sinan/api/routes/upload.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
 
+## Step 8 新增会话动作 API（方案就绪，待实施）
+
+参考对应：`page/api/routes/session.py` 的 `/confirm`(:417)、`/resume`(:350)、`/iterate`(:713)、`/abort`(:1599)。
+sinan 落地位置统一在 `sinan/api/routes/session.py`（已注册于 `app.py:87`，无需改 app）。
+
+| 方法 | 路径 | 认证 | 计划行为 | sinan 落点 | 状态 |
+|---|---|---|---|---|---|
+| POST | `/api/page/session/{session_id}/confirm` | 过渡期无（Step 3 加） | 200 SSE：确认继续生成 / 拒绝保留 paused | `session.py` + `session_action_service.confirm` | 方案就绪 |
+| POST | `/api/page/session/{session_id}/iterate` | 同上 | 200 SSE：多轮修改，产新 PageVersion | `session.py` + `session_action_service.iterate` | 方案就绪 |
+| POST | `/api/page/session/{session_id}/abort` | 同上 | 200 JSON：取消并落 cancelled | `session.py` + `session_action_service.abort` | 方案就绪 |
+| POST | `/api/page/session/{session_id}/resume` | 同上 | 200 SSE：从挂起点继续 | `session.py` + `session_action_service.resume` | 方案就绪（MemorySaver 非持久，等价于 confirm 续跑，见说明） |
+
+> 差异说明：
+> - 参考 `/confirm`、`/iterate` 请求体是无模型的自由 dict（含 `feedback`/`content`/`message`/`link`/`token`/`attachments` 等）；sinan 按实施计划 8.1 引入 `SessionConfirmRequest`/`SessionIterateRequest`/`SessionAbortRequest` 强类型模型，字段更收敛，Step 15 逐字段对照时按此豁免。
+> - 参考 `/resume` 依赖 `runtime_session_store` 检查点；sinan 图用 `MemorySaver`（进程内、不跨重启），故 resume 实为"用 Session 内已存的 `requirement_doc` + 当前页面重跑图续跑"，不是真检查点回放——属两边机制差异，记为待黑盒验证。
+> - 参考 `/abort` 返回 JSON（非 SSE），sinan 对齐为 JSON。
+
 ## 已确认差异（Step 0 基线）
 
 - 路径前缀、资源 API、认证层和请求语义不一致。

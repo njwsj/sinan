@@ -1,0 +1,117 @@
+一、新增：
+	1.iteration_router.py：迭代流程的意图分类入口，在generation_runner.py中的_run_iterate使用，收到反馈，判断反馈要走哪条路径
+		classify_iteration：对用户迭代反馈进行意图分类
+			调用detect_text_replacement
+				判断反馈中的文本替换指令（_REPLACE_PATTERNS）返回要替换的（old，new）列表replacements
+			若replacements不为空，直接返回「文本替换」
+			判断是否为继续生成（_CONTINUE_SIGNALS_EXACT）
+			判断是否为结构性调整（返回：「关键词匹配:结构性变更」）或是否为局部调整（返回：「关键词匹配:局部调整」）
+			上面的都没有命中的话 调用llm判断，返回llm的判定结果
+		detect_text_replacement：检测用户反馈中的文本替换指令，为classify_iteration方法中所用
+		apply_text_replacements：将文本替换对应用到 HTML 代码上，返回更新后的代码与已执行替换的描述列表。
+			为generation_runner.py中的_run_iterate使用，当调用classify_iteration后返回为text_replace后，就调用该函数修改。分为两种方式替换，css id选择器替换/普通文本替换
+			当old为#开头时触发，否则触发普通字符串替换
+	2.direct_editor.py：直接编辑dom，
+		像 修改「#title」: 改为 xxx 这种指令，用 LLM 重生成又慢又可能改坏其它部分。 作用：用 BeautifulSoup 直接定位元素改属性/文案/样式，零 LLM、几十毫秒完成，且带 session 级编辑锁防止并发改同一页面。
+		这里涉及到锁的问题：
+			调用处：generation_runner中的109行
+				async with session_edit_locks.lock_for(job.session_id):
+                	modified, source = direct_editor.try_edit(feedback, html)
+
+			_SessionLockContext与_SessionLockRegistry的关系
+				_SessionLockRegistry           _SessionLockContext
+				（锁的管理者/工厂）              （锁的使用者/执行者）
+
+				lock_for(session_id)  ──────→  返回一个 Context 对象
+				                                   │
+				                               async with 时：
+				                               __aenter__ → 向 Registry 要锁 → acquire()
+				                               __aexit__  → release()
+			进入async with的时候发生了：
+				1. Context.__aenter__() 被调用
+				2. 向 Registry._get_or_create(session_id) 请求锁
+				   └─ 加 _meta_lock（防止并发初始化）
+				      ├─ 字典里有这个 session_id？直接返回已有的锁
+				      └─ 没有？创建新 Lock，写入字典，返回
+				3. 拿到 lock 后调用 lock.acquire()
+				   ├─ 锁空闲 → 立即获得，继续执行
+				   └─ 锁被占用（同一会话另一个编辑正在进行）→ 挂起等待，直到锁释放
+			_meta_lock的作用：
+			解决的是并发初始化问题：假设两个协程同时为同一个新 session 请求锁，没有 _meta_lock 保护时，两者都会走到 lock is None 分支，各自创建一把新锁写入字典，最终字典里只剩后写入的那把——先拿到锁的协程和后拿到锁的协程持有的是两把不同的锁，互不影响，锁就形同虚设了。
+
+			假设用户指令：
+				协程 A: 修改「#btn」: 文案改为 提交
+				协程 B: 修改「#btn」: 背景色改为 red
+				（同一 session_id，几乎同时到达）
+			时间线：
+				A: lock_for(sess) → _get_or_create → 新建 Lock-1 → acquire() → 得锁 ✓
+				B: lock_for(sess) → _get_or_create → 返回 Lock-1 → acquire() → 挂起等待...
+
+				A: try_edit(...) 执行中，读取当前 HTML，修改文案，序列化
+				A: 退出 async with → release() Lock-1
+
+				B: 被唤醒 → acquire() 成功 ✓
+				B: try_edit(...) 执行，读到 A 修改后的 HTML，再改背景色
+				B: 退出 async with → release() Lock-1
+			相当于_meta_lock保护的是_locks字典本身的读写，_get_or_create获取到的锁是针对于每个session的锁
+	3.session_action_service,py：
+		confirm：仅在会话处于 PAUSED（等待确认）状态时合法
+			整体流程：
+				用户提交生成请求
+				    → generation_runner 跑 LangGraph 图
+				        → analyst 节点解析需求
+				            → 置信度 < auto_confirm_threshold（需求模糊）
+				                → 图在 analyst → END，不走后续 designer/coder
+				                    → _run_graph 检测到结果，把 session 置为 PAUSED
+			将当前的session的paused状态改为active状态
+			调用await generation_job_store.create_action_job创建一个confirm job（会作废同 session 的 waiting 旧 Job）
+			触发调度
+		iterate
+			同上，创建一个iterate job并触发调度
+		abort
+		resume
+		其实就是将job的payload字段中的action置为iterate/confirm...）在generation_runner.py L378-384中可通过action判断是走
+
+二、修改
+	1. generation_job_store增加create_action_job 为confirm/iterate/resume 建一个新的 Action Job（不复用活动 Job）。
+	2. 改造generation_runner
+		run_job 按 action 分派：generate→首轮、confirm→续跑、iterate→迭代。同一个 Job 执行入口，三种行为。
+		抽出 _run_graph：把"跑图→消费事件→挂起分支→校验→落版本→发 completed"这段公共逻辑抽出来，三条路径共用，只是喂进去的 initial_state 不同。避免三份重复代码。
+		_build_state：统一构造初始 state；关键点是 confirm/iterate 时注入 iteration_feedback（非空）和 user_confirmed=True，正好命中 analyzer.py:160 的放行分支，让 analyst 不再挂起、直接过到 designer。
+
+三、本轮变化：
+	1. 阶段 A：首轮生成（本阶段基本不变，只是走了新抽的公共方法）
+		POST /api/page/generate
+		  → create_or_get_job (PENDING) → ensure_job_running
+		  → run_job：action 缺省=generate
+		  → _execute_generation_pipeline → _build_state(action=generate) → _run_graph
+	2. 阶段 B：低置信度挂起（已有，本阶段让它"可被唤醒"）
+		analyst 置信度低 → 图在 analyst 后 END
+		  → _run_graph 挂起分支：Session=paused / pipeline=user_confirm
+		  → mark_waiting(Job) → 发 awaiting_confirmation（终止 SSE）
+	3. 阶段 C：用户确认 / 拒绝（全新）
+		POST /session/{id}/confirm  {confirmed}
+		  → service.confirm：校验 paused → Session 置 active
+		  → create_action_job(action=confirm)（作废旧 waiting Job）→ ensure_job_running
+		  → run_job → _run_confirm
+		       confirmed=true  → _build_state 注入 iteration_feedback → _run_graph
+		                         （analyst 这次不挂起，直通 designer→coder→verifier→完成）
+		       confirmed=false → 保留 paused + 发 awaiting_confirmation(rejected) + 记反馈
+		  路由侧：EventSourceResponse 重新订阅 SSE，用户看到续跑事件直到 completed
+	4. 阶段 D：多轮修改（全新，成本分级）
+		POST /session/{id}/iterate  {feedback}
+		  → service.iterate → create_action_job(action=iterate) → run_job → _run_iterate
+		       ① 形如「#id」精确指令 → direct_editor 直接改 DOM → 存新版本 → completed（零 LLM）
+		       ② classify_iteration = text_replace → apply_text_replacements → 存新版本（零 LLM）
+		       ③ partial/structural → _build_state（带入当前 code + feedback，这两个字段到analyst中会被使用到）→ _run_graph → 新版本		
+
+
+
+
+
+
+
+
+
+
+

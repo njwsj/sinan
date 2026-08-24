@@ -34,85 +34,154 @@ class GenerationRunner:
         self.llm = llm
         self.graph = build_graph(llm)
 
-    async def _execute_generation_pipeline(self, job) -> None:
-        """
-        后台异步执行生成流程。
-        由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
 
-        attachments: 前端传来的附件元数据列表（来自 /api/v1/data/upload 响应）。
-                     Runner 从本地文件加载完整数据（hydrate），作为结构化数据传入
-                     LangGraph state["attachments"]，由各 agent 按需读取。
-        """
-        payload = dict(job.request_payload or {})
-        session_id = job.session_id
-        marker = job.marker or f"page_{session_id[:8]}"
-        attachments = payload.get("attachments") or []
+    async def _build_state(self, job, session, *, action: str, body: dict) -> dict:
+        marker = job.marker or f"page_{job.session_id[:8]}"
+        hydrated = await self._hydrate_attachments(job.request_payload.get("attachments") or [])
+        state = {
+            "session_id": job.session_id,
+            "job_id": job.job_id,
+            "marker": marker,
+            "user_id": session.user_id if session else "system",
+            "user_input": session.prompt if session else "",
+            "attachments": hydrated,
+            "datasources": job.request_payload.get("datasources") or [],
+            "template_id": job.request_payload.get("template_id"),
+            "fix_round": 0,
+            "max_fix_rounds": settings.max_fix_rounds,
+            "gate_reports": [], "contract_errors": [], "fix_history": [],
+            "pipeline_state": PipelineState.INIT.value,
+            "status": "routing",
+        }
+        if action in ("confirm", "iterate"):
+            # 关键：iteration_feedback 非空 → analyzer.parse_analyst_response 不再挂起，
+            #       直接 user_confirmed=True 放行到 designer（analyzer.py:160）
+            state["iteration_feedback"] = body.get("feedback") or "(用户已确认，继续生成)"
+            state["user_confirmed"] = True
+            # 迭代时把当前页面代码带进 state，供 analyst/designer 参考（analyzer.py:137 已支持）
+            current = await page_store.get(marker)
+            if current:
+                state["code"] = current.html_content
+        return state
 
-        resolved_marker = marker or f"page_{session_id[:8]}"
-        await session_store.update(
-            session_id,
-            status=SessionStatus.ACTIVE.value,
-            pipeline_state=PipelineState.INIT.value,
+    async def _run_confirm(self, job) -> None:
+        body = (job.request_payload or {}).get("body") or {}
+        session = await session_store.get(job.session_id)
+        marker = job.marker or f"page_{job.session_id[:8]}"
+
+        if not body.get("confirmed", True):
+            # 拒绝：保留 paused，记录反馈，发 awaiting_confirmation(rejected)
+            await session_store.update(
+                job.session_id,
+                status=SessionStatus.PAUSED.value,
+                pipeline_state=PipelineState.USER_CONFIRM.value,
+            )
+            await event_bus.publish(
+                job.session_id, events.AWAITING_CONFIRMATION,
+                {"message": "已收到您的反馈，请补充需求后重新确认",
+                 "rejected": True, "feedback": body.get("feedback") or ""},
+                job_id=job.job_id, marker=marker,
+            )
+            return
+
+        state = await self._build_state(job, session, action="confirm", body=body)
+        await self._run_graph(job, state, session)
+
+
+    async def _run_iterate(self, job) -> None:
+        from sinan.agents.direct_editor import direct_editor, session_edit_locks, DIRECT_EDIT_PRECHECK
+        from sinan.harness.iteration_router import classify_iteration, apply_text_replacements
+
+        body = (job.request_payload or {}).get("body") or {}
+        feedback = body.get("feedback") or ""
+        session = await session_store.get(job.session_id)
+        marker = job.marker or f"page_{job.session_id[:8]}"
+        current = await page_store.get(marker)
+        if current is None:
+            await event_bus.publish(job.session_id, events.ERROR,
+                                    events.error_data("当前会话还没有已生成页面，无法迭代"),
+                                    job_id=job.job_id, marker=marker)
+            return
+        html = current.html_content
+
+        # 1) 直接编辑快路径（形如 修改「#id」: ...）
+        if DIRECT_EDIT_PRECHECK.match(feedback.strip()):
+            async with session_edit_locks.lock_for(job.session_id):
+                modified, source = direct_editor.try_edit(feedback, html)
+            if source == "direct_edit" and modified:
+                await self._save_iteration_version(job, session, marker, modified,
+                                                   note="direct_edit", extra={"direct_edit": True})
+                return
+            # 未命中则继续走分类
+
+        # 2) 分类
+        decision = await classify_iteration(
+            feedback, {"session_id": job.session_id, "marker": marker},
+            history=(session.messages or []) if session else None,
+            llm=self.llm,
         )
-        await cancel_registry.clear_async(session_id)
+
+        # 3) 纯文本替换
+        if decision.get("change_scope") == "text_replace":
+            modified, applied = apply_text_replacements(html, decision["replacements"])
+            if applied:
+                await self._save_iteration_version(job, session, marker, modified,
+                                                   note="text_replace")
+                return
+
+        # 4) structural/partial → 重跑图（iteration_feedback 已在 _build_state 注入）
+        state = await self._build_state(job, session, action="iterate", body=body)
+        # 可选：把 decision.target_step 记进 state 供 designer/coder 决定改动范围
+        state["iteration_route"] = decision
+        await self._run_graph(job, state, session)
+
+    async def _save_iteration_version(self, job, session, marker, html, *, note="", extra=None):
+        version = await page_store.next_version(marker)
+        await page_store.save(marker=marker, version=version, html=html,
+                              created_by=session.user_id if session else "system",
+                              session_id=job.session_id,
+                              title=(session.prompt if session else "")[:128], note=note)
+        preview_url = f"/api/page/preview/{marker}"
+        await session_store.update(job.session_id,
+                                   status=SessionStatus.COMPLETED.value,
+                                   pipeline_state=PipelineState.DELIVERED.value,
+                                   marker=marker, version=version, preview_url=preview_url)
+        data = events.completed_data(version=version, preview_url=preview_url, quality_score=0.0)
+        if extra:
+            data.update(extra)
+        await event_bus.publish(job.session_id, events.COMPLETED, data,
+                                job_id=job.job_id, marker=marker)
+
+
+    async def _run_graph(self, job, initial_state: dict, session) -> None:
+        """跑一遍 LangGraph 图并处理结果：消费事件 → 挂起分支 → 校验 → 落版本 → 发 completed。
+
+        generate / confirm / iterate 三条路径共用，差异只体现在传入的 initial_state。
+        initial_state 必须已包含 session_id / job_id / marker / user_input / attachments 等字段
+        （由 _build_state 构造）。session 用于取 user_id / prompt / title。
+        """
+        session_id = job.session_id
+        resolved_marker = initial_state.get("marker") or f"page_{session_id[:8]}"
+
+        step_labels = {
+            "router": "正在识别需求意图...",
+            "analyst": "正在分析需求...",
+            "designer": "正在制定设计方案...",
+            "coder": "AI 正在生成页面代码...",
+            "verifier": "正在验证页面...",
+            "fixer": "正在修复问题...",
+        }
 
         try:
-            session = await session_store.get(session_id)
-            prompt = session.prompt if session else ""
-
-            # hydrate：从本地 JSON 文件加载 Excel 完整数据，填入 parsed 字段
-            # parsed 结构：{"columns": [...], "rows": [...全量，不截断...], "row_count": int}
-            hydrated: list[dict] = []
-            for att in (attachments or []):
-                file_id = att.get("file_id", "")
-                json_path = Path(settings.attachment_storage_path) / f"{file_id}.json"
-                if json_path.exists():
-                    parsed = json.loads(json_path.read_text(encoding="utf-8"))
-                    hydrated.append({**att, "parsed": parsed})
-                    logger.info("hydrated attachment: file_id=%s rows=%d", file_id, parsed.get("row_count", 0))
-                else:
-                    logger.warning("attachment file not found, skipping: file_id=%s", file_id)
-                    hydrated.append(att)
-
-
-            # 执行 LangGraph 图（内部串行执行 analyze → design → code → verify）
-            # attachments 作为结构化数据传入 state，由 analyzer/coder 各自按需读取
-
-            step_labels = {
-                "router": "正在识别需求意图...",
-                "analyst": "正在分析需求...",
-                "designer": "正在制定设计方案...",
-                "coder": "AI 正在生成页面代码...",
-                "verifier": "正在验证页面...",
-                "fixer": "正在修复问题...",
-            }
             final_state = None
             async for event in self.graph.astream_events(
-                    {
-                        "session_id": session_id,
-                        "job_id": job.job_id,
-                        "marker": resolved_marker,
-                        "user_id": session.user_id if session else "system",
-                        "user_input": prompt,
-                        "attachments": hydrated,
-                        "datasources": payload.get("datasources") or [],
-                        "template_id": payload.get("template_id"),
-                        "fix_round": 0,
-                        "max_fix_rounds": settings.max_fix_rounds,
-                        "gate_reports": [],
-                        "contract_errors": [],
-                        "fix_history": [],
-                        "pipeline_state": PipelineState.INIT.value,
-                        "status": "routing",
-                    },
+                    initial_state,
                     config={"configurable": {"thread_id": session_id}},
                     version="v2",
             ):
                 # —— 运行中取消检测（节点边界，跨实例） ——
                 if await cancel_registry.is_cancelled_async(session_id):
                     await generation_job_store.request_cancel(job_id=job.job_id)
-                    # 参考项目没有 cancelled 会话态（取消由 error 事件承载），
-                    # 这里落 failed + error_message，作为未对齐项记录在 state-matrix。
                     await session_store.update(
                         session_id,
                         status=SessionStatus.FAILED.value,
@@ -124,10 +193,10 @@ class GenerationRunner:
                         job_id=job.job_id, marker=resolved_marker,
                     )
                     return  # 正常返回，run_job 复查到 cancelled 不置 completed
+
                 kind = event["event"]
                 name = event.get("name", "")
 
-                # 节点开始时推进度事件
                 if kind == "on_chain_start":
                     node_name = event.get("metadata", {}).get("langgraph_node", "")
                     if node_name in step_labels:
@@ -138,14 +207,10 @@ class GenerationRunner:
                         )
                         await self._write_step(session_id, node_name, f"开始{node_name}")
 
-                # 节点结束：只用于捕获整图完成后的最终 state
                 elif kind == "on_chain_end":
-                    # 图执行结束后拿到最终 state
                     if event.get("run_id") and name == "LangGraph":
                         final_state = event["data"].get("output")
 
-            # fix_start / fix_applied 现在由 fixer 节点内部按轮发布，
-            # runner 不再事后补发，否则同一轮会出现两条 fix_applied。
             fix_round = final_state.get("fix_round", 0)
             verification = final_state.get("verification_result") or {}
             quality_score = float(verification.get("quality_score") or 0.0)
@@ -156,7 +221,6 @@ class GenerationRunner:
                 await session_store.update(
                     session_id,
                     status=SessionStatus.PAUSED.value,
-                    # sinan 增量：参考 analyst 只写 analysis，session 级 user_confirm 是本项目扩展
                     pipeline_state=PipelineState.USER_CONFIRM.value,
                     requirement_doc=final_state.get("requirement_doc") or "",
                 )
@@ -165,13 +229,13 @@ class GenerationRunner:
                     {
                         "message": "需求信息不足，请确认后继续",
                         "confirmation_digest": (final_state.get("analysis_output") or {})
-                            .get("confirmation_digest", ""),
+                        .get("confirmation_digest", ""),
                         "requirement_doc": final_state.get("requirement_doc") or "",
                     },
                     job_id=job.job_id, marker=resolved_marker,
                 )
                 await generation_job_store.mark_waiting(job.job_id, _OWNER)
-                return   # Job 落 waiting，等 Step 8 的确认接口恢复
+                return  # Job 落 waiting，等确认接口恢复
 
             verify_message = (
                 "校验通过" if verification.get("passed")
@@ -197,10 +261,6 @@ class GenerationRunner:
             html = final_state["code"]
 
         except Exception as e:
-            """
-            注意：原 start() 内部 except 里对 session 的 FAILED 终态写入建议去掉（保留推 error 事件即可），
-            让终态统一由 run_job 决定。异常直接抛出交给 run_job 接住。
-            """
             logger.exception("generation failed for session %s", session_id)
             await event_bus.publish(
                 session_id, events.ERROR, events.error_data(f"生成失败：{e}"),
@@ -209,10 +269,9 @@ class GenerationRunner:
             return
 
         # 托管：写 page_version 表，更新 session
-        marker = resolved_marker
-        version = await page_store.next_version(marker)
+        version = await page_store.next_version(resolved_marker)
         await page_store.save(
-            marker=marker,
+            marker=resolved_marker,
             version=version,
             html=html,
             created_by=session.user_id if session else "system",
@@ -221,21 +280,17 @@ class GenerationRunner:
             harness_score=quality_score,
             repair_rounds=fix_round,
         )
-        # 拼预览 URL（本地开发用 /page/{marker}，生产替换域名）
-        preview_url = f"/api/page/preview/{marker}"
-        # 更新 session：状态 DONE + marker + version + preview_url
+        preview_url = f"/api/page/preview/{resolved_marker}"
         await session_store.update(
             session_id,
             status=SessionStatus.COMPLETED.value,
             pipeline_state=PipelineState.DELIVERED.value,
-            marker=marker,
+            marker=resolved_marker,
             version=version,
             preview_url=preview_url,
             fix_rounds=fix_round,
             verification_score=quality_score,
         )
-
-        # 推送托管完成事件，再关闭 SSE 流
         await event_bus.publish(
             session_id, events.COMPLETED,
             events.completed_data(
@@ -243,8 +298,34 @@ class GenerationRunner:
                 preview_url=preview_url,
                 quality_score=quality_score,
             ),
-            job_id=job.job_id, marker=marker,
+            job_id=job.job_id, marker=resolved_marker,
         )
+
+    async def _execute_generation_pipeline(self, job) -> None:
+        """
+        后台异步执行生成流程。
+        由 generate 路由通过 asyncio.create_task 启动，不阻塞请求。
+
+        attachments: 前端传来的附件元数据列表（来自 /api/v1/data/upload 响应）。
+                     Runner 从本地文件加载完整数据（hydrate），作为结构化数据传入
+                     LangGraph state["attachments"]，由各 agent 按需读取。
+        """
+        payload = dict(job.request_payload or {})
+        session_id = job.session_id
+        marker = job.marker or f"page_{session_id[:8]}"
+        attachments = payload.get("attachments") or []
+
+        resolved_marker = marker or f"page_{session_id[:8]}"
+        await session_store.update(
+            session_id,
+            status=SessionStatus.ACTIVE.value,
+            pipeline_state=PipelineState.INIT.value,
+        )
+        await cancel_registry.clear_async(session_id)
+
+        session = await session_store.get(session_id)
+        initial_state = await self._build_state(job, session, action="generate", body={})
+        await self._run_graph(job, initial_state, session)
 
     async def _write_step(self, session_id: str, step: str, message: str) -> None:
         """把步骤执行记录写入 gen_session_step 表"""
@@ -257,6 +338,21 @@ class GenerationRunner:
         async with AsyncSessionLocal() as db:
             db.add(record)
             await db.commit()
+
+    async def _hydrate_attachments(self, attachments: list) -> list[dict]:
+        """从本地 JSON 文件加载 Excel 完整数据，填入 parsed 字段。"""
+        hydrated: list[dict] = []
+        for att in (attachments or []):
+            file_id = att.get("file_id", "")
+            json_path = Path(settings.attachment_storage_path) / f"{file_id}.json"
+            if json_path.exists():
+                parsed = json.loads(json_path.read_text(encoding="utf-8"))
+                hydrated.append({**att, "parsed": parsed})
+                logger.info("hydrated attachment: file_id=%s rows=%d", file_id, parsed.get("row_count", 0))
+            else:
+                logger.warning("attachment file not found, skipping: file_id=%s", file_id)
+                hydrated.append(att)
+        return hydrated
 
 
 
@@ -279,7 +375,13 @@ class GenerationRunner:
         """
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(job_id))
         try:
-            await self._execute_generation_pipeline(job)
+            action = (job.request_payload or {}).get("action", "generate")
+            if action == "confirm":
+                await self._run_confirm(job)
+            elif action == "iterate":
+                await self._run_iterate(job)
+            else:
+                await self._execute_generation_pipeline(job)
             latest = await generation_job_store.get_job(job_id)   # finalize 前复查
             if latest and latest.status == CANCELLED:
                 return                                            # 被取消：不置 completed

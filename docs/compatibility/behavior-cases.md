@@ -14,10 +14,10 @@
 | 8 | 取消生成 | 有 abort | 部分（Step 4） | Redis `cancel_registry` 支持运行中节点边界打断+cancelled 事件；打断粒度/事件顺序待黑盒验证 |
 | 9 | 服务重启恢复 | 有 Job Supervisor | 部分（Step 4） | lease/retry/supervisor 已具备，待黑盒验证 |
 | 10 | 复用已有 Session | 有 | 部分（Step 4） | `create_or_get_job` 按 session 复用活动 Job，session_id 语义待验证 |
-| 11 | 修改已有页面 | 有 iterate | 缺失 | 版本和上下文（state 已有 `iteration_feedback`/`history_messages` 占位，行为属 Step 8） |
-| 12 | 用户确认 | 有 confirm | 部分（Step 7） | 低置信度已能挂起：session=paused、pipeline_state=user_confirm、job=waiting、发 `awaiting_confirmation`；确认接口属 Step 8 |
-| 13 | 用户拒绝 | 有 confirm(false) | 缺失 | rejected/反馈（Step 8） |
-| 14 | 反馈后二次生成 | 有 | 缺失 | 新 Job/版本 |
+| 11 | 修改已有页面 | 有 iterate | 方案就绪（Step 8，待实施） | `POST /session/{id}/iterate` + `iteration_router.classify_iteration` + `direct_editor`；runner `_run_iterate` 产出新 PageVersion，旧版本不可变。待黑盒验证：结构性/局部/文本替换三分支路由与版本递进 |
+| 12 | 用户确认 | 有 confirm | 部分→方案就绪（Step 8） | 挂起已具备（Step 7）；`POST /session/{id}/confirm` confirmed=true 置 active 并重跑图（iteration_feedback 非空使 analyst 不再挂起）。待验证：确认后 SSE 续流与最终版本 |
+| 13 | 用户拒绝 | 有 confirm(false) | 方案就绪（Step 8，待实施） | `_run_confirm` 拒绝分支：保留 paused、发 `awaiting_confirmation`(rejected=true, feedback)。待验证 payload 与参考差异 |
+| 14 | 反馈后二次生成 | 有 | 方案就绪（Step 8，待实施） | `create_action_job(action=iterate)` 建新 Job → supervisor 执行 → 新版本。待验证 Job/版本链路 |
 | 15 | 上传 Excel | 有 | 部分 | 元数据、内容和权限 |
 | 16 | 上传 CSV | 有 | 部分 | 解析和存储 |
 | 17 | 上传图片 | 有 | 缺失/待测 | MIME、对象存储 |

@@ -196,3 +196,24 @@ class GenerateRequest(BaseModel):
         validation_alias=AliasChoices("skill_keys", "skillKeys"),
     )
     mode: str | None = None
+
+# ─── Step 8: 会话动作请求 ───────────────────────────
+class SessionConfirmRequest(BaseModel):
+    """用户对低置信度需求的确认。confirmed=false 表示拒绝并附反馈。"""
+
+    confirmed: bool = True
+    feedback: str | None = None
+
+
+class SessionIterateRequest(BaseModel):
+    """已完成页面的多轮修改反馈。mode 可显式指定路由（design/generation/direct_edit）。"""
+
+    feedback: str = Field(..., min_length=1)
+    mode: str | None = None
+    attachments: list[dict] = Field(default_factory=list)
+
+
+class SessionAbortRequest(BaseModel):
+    """中止当前会话的生成/迭代。reason 仅用于记录。"""
+
+    reason: str | None = None

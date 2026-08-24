@@ -59,7 +59,7 @@ pending → running → completed
 pending/running → failed
 pending/running → cancelled     # mark_cancelled
 running → waiting               # Step 7 起有发布点：mark_waiting（analyst 低置信度挂起）
-waiting → running               # 恢复执行属 Step 8
+waiting → (superseded)          # Step 8 方案：确认不复用 waiting Job，改由 create_action_job 建新 Job 承接
 running(租约过期) → running      # 重新领取，attempts+1，直至 max_attempts
 ```
 
@@ -70,7 +70,10 @@ running(租约过期) → running      # 重新领取，attempts+1，直至 max_
 （where `lease_owner == owner`）命中 0 行，挂起的 Job 不会被误置 completed。
 注意 `ACTIVE_STATUSES = {pending, running}` 不含 `waiting`，所以挂起 Job 不会被
 supervisor 重新领取、也不会被 `create_or_get_job` 复用——用户重新发起会新建 Job。
-该语义是否合适待 Step 8 的确认接口落地后复核。
+**Step 8 方案确认此语义**：确认/迭代接口不"唤醒"waiting Job，而是通过新增
+`create_action_job()` 建一个 PENDING 的 Action Job（携带 `action`/`body`），由 supervisor
+或 `ensure_job_running` 执行；原 waiting Job 可在建新 Job 时一并置 cancelled（superseded），
+避免同 session 悬挂多个 waiting。
 
 页面状态 `PageStatus`（`enums.py:66`，现由 `page` 主表承载，`page_version` 已无 status 列）：
 
@@ -91,8 +94,8 @@ draft → preview → published → archived
 | 独立 Job | 是 | 是 | 已对齐；`waiting` 自 Step 7 起有发布点（`mark_waiting`），常量已收敛到 `JobStatus` |
 | 取消/abort | 是（error 事件承载） | 部分 | 运行中可在**节点边界**打断；Session 落 `failed` + `error_message="cancelled by user"`。参考无 cancelled 会话态，语义等价性待 Step 15 黑盒确认 |
 | resume/reconnect | 是 | 部分 | lease 过期→supervisor 重新领取可恢复；SSE 事件落 Redis List，带 `Last-Event-ID`/`cursor` 可回放（Step 5） |
-| confirm/reject | 是 | 部分 | Step 7：analyst 置信度 < `auto_confirm_threshold`(0.3) 时图在 analyst 后终止，Session 落 `paused` + `user_confirm`，Job 落 `waiting`，发 `awaiting_confirmation` 事件；确认/拒绝接口与恢复执行属 Step 8 |
-| 二次 iterate | 是 | 否 | 缺失（Step 8）；state 已有 `iteration_feedback` / `history_messages` 占位 |
+| confirm/reject | 是 | 部分→方案就绪（Step 8） | Step 7：analyst 置信度 < `auto_confirm_threshold`(0.3) 时图在 analyst 后终止，Session 落 `paused` + `user_confirm`，Job 落 `waiting`，发 `awaiting_confirmation` 事件；**Step 8 方案（待实施）**：`session_action_service.confirm/resume` 校验 owner+状态→`create_action_job(action=confirm)`→session 置 `active`→`ensure_job_running`；runner `_run_confirm` 用 `iteration_feedback` 非空绕过 analyst 挂起分支继续生成。拒绝分支保留 `paused` |
+| 二次 iterate | 是 | 否→方案就绪（Step 8，待实施） | `session_action_service.iterate`→`iteration_router.classify_iteration` 四分支(structural/partial/text_replace/unclear)；text_replace/直接编辑走 `direct_editor`（bs4）零 LLM 产新版本，其余 `create_action_job(action=iterate)` 重跑图。state 的 `iteration_feedback`/`history_messages` 占位本 Step 起真正使用 |
 | 页面版本状态 | Page 主表 + 不可变 PageVersion | 同结构（Step 6） | 已对齐；发布链路（published_to/BOS）待 Step 9/10 |
 | 门禁报告 | 6 个门（schema_validation / user_confirmation / design_completeness / syntax_integrity / quality_threshold / render_success） | 同 6 个门（Step 7） | 门名、阈值、分派表已对齐；报告额外带 `decision`/`issues`/`timestamp` 三个字段，参考只有 `gate/step/passed/score/auto_confirmed/requires_user`（`page/harness/orchestrator.py:119-126`），属 sinan 增量 |
 | 契约校验 | 5 个步骤输出契约，违规只记录不阻断 | 同 5 个（Step 7），写入 `state["contract_errors"]` | 已对齐。注意 ANALYSIS（缺 `functional_modules`）与 VALIDATION（缺 `total_rounds`）两个契约在**两边都稳定失败**，因为 analyst/verifier 实际产出结构与契约不符——参考既有行为，不要"修好" |
