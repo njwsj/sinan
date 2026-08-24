@@ -30,6 +30,8 @@ from sinan.api.routes.pages import router as pages_router
 from sinan.api.routes.upload import router as upload_router
 from sinan.api.routes.audit import router as audit_router
 from sinan.api.routes import data as data_routes
+from sinan.api.routes.template import router as template_router
+from sinan.api.routes.prompt_template import router as prompt_template_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -90,6 +92,8 @@ def create_app() -> FastAPI:
     app.include_router(pages_router)
     app.include_router(preview_page_router)
     app.include_router(upload_router)
+    app.include_router(template_router)  # Step 11：HTML 模板管理
+    app.include_router(prompt_template_router)  # Step 11：Prompt 模板管理
     app.include_router(hosting_router)  # Step 10：托管 + 发布/取消/回滚
     app.include_router(storage_router)  # Step 10：服务 LocalStorage 文件
     # 旧接口，过渡期保留

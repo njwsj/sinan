@@ -41,6 +41,12 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个前端代码修复工程师。根据验�
 - 需求分析中要求的核心组件（图表、表格、筛选、指标卡等）必须实现
 - 验收标准中的关键要求（如响应式 viewport）必须满足
 
+模板一致性（仅当使用了模板时校验）：
+- 保留模板的 CSS 变量定义，确保视觉风格一致
+- 保持与模板一致的布局方式（Grid/Flex）
+- 保留模板的主色调和配色方案
+- 保持与模板相同的图表库，不得替换
+
 数据一致性：
 - 数据字段名必须与用户上传文件的列名保持一致
 - 指标数值应从数据中计算得出，不应硬编码到 innerHTML/textContent
@@ -108,6 +114,15 @@ def _section(title: str, value: object) -> str:
     text = _doc_text(value)
     return f"\n\n## {title}\n{text}" if text else ""
 
+def _template_context(template_code: str | None) -> str:
+    """返回压缩后的模板 HTML，用于修复时的风格约束。"""
+    if not template_code:
+        return ""
+    import re as _re
+    minified = _re.sub(r'<!--.*?-->', '', template_code, flags=_re.DOTALL)
+    minified = _re.sub(r'>\s+<', '><', minified)
+    minified = _re.sub(r'\s{2,}', ' ', minified).strip()
+    return f"\n\n## 参考模板（必须保持风格、配色、布局和图表库一致）\n```html\n{minified}\n```"
 
 def _repair_context(state: GenerationState) -> str:
     parts = [
@@ -117,6 +132,7 @@ def _repair_context(state: GenerationState) -> str:
         _section("页面设计", state.get("design_doc")),
         _section("原始数据区", _raw_data_context(state)),
         _section("外部知识/工具结果", state.get("external_knowledge")),
+        _template_context(state.get("template_code")),  # ← 新增
     ]
     return "".join(p for p in parts if p).strip() or "无额外上下文"
 

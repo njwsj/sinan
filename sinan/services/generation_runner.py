@@ -325,6 +325,30 @@ class GenerationRunner:
 
         session = await session_store.get(session_id)
         initial_state = await self._build_state(job, session, action="generate", body={})
+        # ── 模板代码加载（集中在此处，对齐参考 generate.py:639-645）──
+        # prompt_template_id 优先：取源页面代码作为模板基准
+        prompt_template_id = payload.get("prompt_template_id")
+        template_id = payload.get("template_id")
+        if prompt_template_id:
+            from sinan.services.template_store import template_store as _ts
+            tmpl = await _ts.resolve_prompt_template(prompt_template_id)
+            if tmpl and tmpl.template_id:  # template_id 字段存的是源页面 marker
+                source_page = await page_store.get(tmpl.template_id)
+                if source_page and source_page.html_content:
+                    initial_state["template_code"] = source_page.html_content
+                    logger.info(
+                        "prompt_template branch: id=%s source_marker=%s session=%s",
+                        prompt_template_id, tmpl.template_id, session_id,
+                    )
+                else:
+                    logger.warning("prompt_template source page not found: id=%s", prompt_template_id)
+        elif template_id:
+            from sinan.services.template_store import template_store as _ts
+            template_code = await _ts.download_html_template(template_id)
+            if template_code:
+                initial_state["template_code"] = template_code
+            else:
+                logger.warning("template_id not found or unreadable: %s", template_id)
         await self._run_graph(job, initial_state, session)
 
     async def _write_step(self, session_id: str, step: str, message: str) -> None:

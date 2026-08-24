@@ -1,0 +1,157 @@
+1. prompt_template_id和template_id区别：
+	prompt_template_id：直接复用一个已经生成好的页面，在它的基础上快速生成新页面。page_template 表里 type='prompt' 的记录，
+		前端传 prompt_template_id
+	    → 查到 PageTemplate 记录（type=prompt）
+	    → 从 template.template_id 字段取出源页面的 marker
+	    → 从 page_version 表找到那个页面已生成的 HTML
+	    → 注入 state["template_code"]（同样是 HTML，但来源是已生成的页面）
+	    → LLM 以这个页面为基准生成新页面
+	template_id：提供一个现成的 HTML 文件作为视觉基准，page_template 表里 type='html' 的记录
+		前端传 template_id
+	    → generate.py 从 storage 下载该 HTML 文件内容
+	    → 注入 state["template_code"]
+	    → designer/coder/fixer 把它压缩后追加进 prompt
+	    → LLM 生成时"参考这个模板的风格"
+
+2. 模版生成页面整体流程：
+	逻辑上 router/analyst 不需要 template_code 是合理的：
+		router 只判断"这个需求是生成页面还是聊天"，与模板无关
+		analyst 只分析"用户要什么功能"，模板影响的是视觉风格不是功能需求，所以也不需要
+	━━━━━━━━━━━━━━━━━━━ 模板的产生 ━━━━━━━━━━━━━━━━━━━
+
+			  【管理员上传 HTML 模板】
+			  POST /api/page/templates
+			  multipart: file=index.html, thumbnail=thumb.png, name=...
+			       │
+			       ▼
+			  template.py (router)
+			       │  html_content = await file.read()
+			       │  thumbnail_content = await thumbnail.read()
+			       ▼
+			  template_store.create_html_template()
+			       │  storage.put("template/{id}/index.html", html_content)
+			       │  storage.put("template/{id}/thumbnail", thumbnail_content)
+			       │  INSERT page_template(type='html', bos_path=..., status='active')
+			       ▼
+			  page_template 表
+			  ┌─────────────────────────────────────────────┐
+			  │ template_id │ type  │ bos_path              │
+			  │ abc123      │ html  │ template/abc123/...   │
+			  └─────────────────────────────────────────────┘
+
+
+			  【（未实现）Prompt 模板 = 已生成页面另存为模板】
+			  page_template 表
+			  ┌─────────────────────────────────────────────────────┐
+			  │ template_id(本记录ID) │ type   │ template_id(字段)  │
+			  │ def456               │ prompt │ <源页面的 marker>   │
+			  └─────────────────────────────────────────────────────┘
+			  注：template_id 字段复用存源页面 marker，无独立 HTML 文件
+
+
+			━━━━━━━━━━━━━━━━━━━ template_id 流转 ━━━━━━━━━━━━━━━━━━━
+
+			  前端 POST /api/page/generate
+			  { "prompt": "...", "template_id": "abc123" }
+			       │
+			       ▼
+			  generate.py: _create_or_reuse_generation()
+			       │  req.model_dump() → payload = { ..., "template_id": "abc123" }
+			       │  generation_job_store.create_or_get_job(payload=payload)
+			       │       ↓ payload 序列化存进 generation_job.request_payload
+			       │  返回 SSE 流（Job 异步跑）
+			       ▼
+			  generation_job 表
+			  ┌──────────────────────────────────────────────────┐
+			  │ job_id │ request_payload                         │
+			  │ xxx    │ { "template_id": "abc123", "prompt":... }│
+			  └──────────────────────────────────────────────────┘
+			       │ supervisor 定时捞起
+			       ▼
+			  generation_runner._execute_generation_pipeline(job)
+			       │
+			       │  payload = job.request_payload
+			       │  template_id = payload.get("template_id")   ← 从 payload 取
+			       │
+			       │  ┌─────────────────────────────────────┐
+			       │  │ template_store.download_html_template│
+			       │  │ storage.get("template/abc123/...")   │
+			       │  │ → html_content: str                  │
+			       │  └──────────────────┬──────────────────┘
+			       │                     │
+			       │  initial_state["template_code"] = html_content
+			       ▼
+			  _run_graph(job, initial_state, session)
+			       │
+			       ▼
+			  LangGraph 图（initial_state 携带 template_code 透传）
+			       │
+			       ├──► router    state.get("template_code") → 不使用
+			       │
+			       ├──► analyst   state.get("template_code") → 不使用
+			       │
+			       ├──► designer  state.get("template_code") → 使用
+			       │    build_designer_context()
+			       │      minified = 去script/去注释/合并空白
+			       │      context += "参考模板（保留风格/配色/布局）:\n```html\n{minified}\n```"
+			       │      → LLM 输出的 design_doc 里 style_tokens 向模板靠拢
+			       │
+			       ├──► coder     state.get("template_code") → 使用
+			       │    run()
+			       │      检测图表库: Chart.js? ECharts?
+			       │      minified = 去注释/合并空白
+			       │      user_content += "模板代码（必须遵循结构/配色/图表库）:\n```html\n{minified}\n```"
+			       │      → LLM 生成的 HTML "长得像模板"
+			       │
+			       ├──► verifier  state.get("template_code") → 使用 
+			       │    TemplateValidator().validate(code, template_code)
+			       │      ├─ CSS变量保留率 < 50% → P1
+			       │      ├─ 模板用Grid但页面无Grid/Flex → P1
+			       │      └─ 配色完全不重叠 → P1
+			       │    有P0/P1 → 触发 fixer
+			       │
+			       └──► fixer     state.get("template_code") → 使用
+			            _template_context()
+			              minified = 去注释/合并空白
+			              context += "参考模板（保持风格/配色/布局/图表库一致）:\n```html\n{minified}\n```"
+			            → LLM 修复时不偏离模板风格
+			       │
+			       ▼
+			  page_store.save() → 写 PageVersion / Page 表
+			  event_bus.publish(COMPLETED)
+
+
+			━━━━━━━━━━━━━━━━━━━ prompt_template_id 流转 ━━━━━━━━━━━━━━━━━━━
+
+			  前端 POST /api/page/generate
+			  { "prompt": "...", "prompt_template_id": "def456" }
+			       │
+			       ▼
+			  generate.py: _create_or_reuse_generation()
+			       │  template_store.resolve_prompt_template("def456")
+			       │      SELECT WHERE template_id='def456' AND type='prompt' AND status='active'
+			       │      → 有效则保留, 无效则 req.model_copy(prompt_template_id=None) 清空
+			       │  payload 存库（含 prompt_template_id）
+			       ▼
+			  generation_runner._execute_generation_pipeline(job)
+			       │  prompt_template_id = payload.get("prompt_template_id")
+			       │
+			       │  template_store.resolve_prompt_template("def456")
+			       │  → tmpl.template_id = "<源页面的 marker>"  ← 关键：字段复用
+			       │
+			       │  page_store.get("<源页面 marker>")
+			       │  → source_page.html_content = 源页面已生成的 HTML
+			       │
+			       │  initial_state["template_code"] = source_page.html_content
+			       ▼
+			  （之后与 template_id 路径完全相同）
+			  LangGraph 图：designer/coder/verifier/fixer 都带着源页面 HTML 作约束
+
+
+			━━━━━━━━━━━━━━ template_code 在图中的生命周期 ━━━━━━━━━━━━━
+
+			  注入点         → _execute_generation_pipeline (一次)
+			  存储位置       → LangGraph state["template_code"]
+			  读取方式       → 各节点 state.get("template_code")
+			  压缩时机       → 各节点使用前临时压缩（不修改 state）
+			  销毁时机       → 图执行结束，state 不持久化到 DB

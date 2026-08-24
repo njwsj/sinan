@@ -15,6 +15,8 @@ from sinan.services.session_store import session_store
 from sinan.services.generation_job_store import generation_job_store
 from sinan.services.generation_supervisor import ensure_job_running
 from sinan.services import cancel_registry
+# 在现有 import 列表末尾添加：
+from sinan.services.template_store import template_store
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +78,17 @@ async def _create_or_reuse_generation(
 ) -> tuple[str, str, bool]:
     session_id = req.session_id or uuid.uuid4().hex
     marker = req.marker or uuid.uuid4().hex
+
+    # ── Prompt template 校验：有效则放行，无效则 fallback（与参考行为一致）──
+    if req.prompt_template_id:
+        tmpl = await template_store.resolve_prompt_template(req.prompt_template_id)
+        if not tmpl:
+            logger.warning(
+                "prompt_template_id not found or inactive: %s, falling back to normal generation",
+                req.prompt_template_id,
+            )
+            # 无效时清空，不阻断请求，交给后续正常生成（参考行为：fall through）
+            req = req.model_copy(update={"prompt_template_id": None})
 
     """
     存在的意义：保证同一个 session_id 只启动一次生成任务。

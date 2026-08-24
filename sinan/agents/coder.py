@@ -57,6 +57,9 @@ class CoderAgent:
     13. 禁止把两个 bar 系列分别绑到不同 y 轴；量纲不同时第二系列必须用 line；双 y 轴 grid.right ≥ 60
     14. 模板字符串中引用的变量名必须与 const/let/var 声明名大小写完全一致
     15. 必须包含 <meta name="viewport" content="width=device-width, initial-scale=1">
+    ## 模板规范
+    - 如果有模板代码，页面结构、样式和交互需要参考模板内容。
+    - 如果有模板代码，图表颜色优先遵循模板配色，不受下方色板规则约束。
     """
 
     def __init__(self, llm: LLMClient):
@@ -75,6 +78,26 @@ class CoderAgent:
         att_context = _build_att_context(state.get("attachments") or [])
         if att_context:
             user_content += att_context
+
+        # 模板代码注入（对齐参考 coder.py:596-613）
+        template_code = state.get("template_code")
+        if template_code:
+            import re as _re
+            # 检测模板使用的图表库，提示 LLM 不要替换
+            if _re.search(r'chart\.js|chart\.umd|chart\.min\.js|new\s+Chart\s*\(', template_code, _re.IGNORECASE):
+                chart_lib_hint = "（此模板使用 Chart.js，必须保留该图表库，不得替换为其他库）"
+            elif _re.search(r'echarts', template_code, _re.IGNORECASE):
+                chart_lib_hint = "（此模板使用 ECharts，必须保留该图表库，不得替换为其他库）"
+            else:
+                chart_lib_hint = ""
+            # 压缩模板：去注释、合并空白，减少 token 占用
+            minified = _re.sub(r'<!--.*?-->', '', template_code, flags=_re.DOTALL)
+            minified = _re.sub(r'>\s+<', '><', minified)
+            minified = _re.sub(r'\s{2,}', ' ', minified).strip()
+            user_content += (
+                f"\n\n模板代码{chart_lib_hint}（必须严格遵循此模板的结构、配色和风格，"
+                f"图表使用与模板相同的库和 API）:\n```html\n{minified}\n```"
+            )
 
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
