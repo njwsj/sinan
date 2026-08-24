@@ -3,7 +3,6 @@ import uuid
 from sqlalchemy import select
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import GenSession
-from sinan.models.enums import SessionStatus
 from sinan.models.enums import PipelineState, SessionStatus
 
 
@@ -88,6 +87,71 @@ class SessionStore:
             for key, value in kwargs.items():
                 setattr(session, key, value)
             await db.commit()
+
+    async def save_attachment(self, session_id: str, attachment: dict) -> None:
+        """把附件元信息写入 attachment 表，session.attachments 只保存 file_id 列表。"""
+        from sinan.models.tables import Attachment
+        from sqlalchemy import select as _select
+
+        file_id = attachment.get("file_id") or ""
+        if not file_id:
+            return
+
+        # 1. 写 attachment 表（幂等）
+        async with AsyncSessionLocal() as db:
+            existing = (
+                await db.execute(_select(Attachment).where(Attachment.file_id == file_id))
+            ).scalar_one_or_none()
+            if existing is None:
+                db.add(Attachment(
+                    file_id=file_id,
+                    session_id=session_id,
+                    user_id="",
+                    file_name=attachment.get("filename") or "",
+                    file_type=attachment.get("parse_type") or "",
+                    file_size=attachment.get("size") or 0,
+                    storage_path=attachment.get("raw_storage_uri") or attachment.get("storage_uri") or "",
+                    row_count=attachment.get("row_count"),
+                    meta={k: v for k, v in attachment.items()
+                          if k not in ("file_id", "filename", "file_size", "storage_path")},
+                ))
+                await db.commit()
+
+        # 2. session.attachments 只保存 file_id 字符串列表
+        session = await self.get(session_id)
+        if session is None:
+            return
+        current_ids: list[str] = []
+        for item in (session.attachments or []):
+            fid = item if isinstance(item, str) else item.get("file_id", "")
+            if fid:
+                current_ids.append(fid)
+        if file_id not in current_ids:
+            current_ids.append(file_id)
+        await self.update(session_id, attachments=current_ids)
+
+    async def save_attachment_by_marker(self, marker: str, attachment: dict) -> None:
+        """按 marker 找最近的 session，再调 save_attachment。"""
+        from sqlalchemy import select as _select
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                _select(GenSession.session_id)
+                .where(GenSession.marker == marker)
+                .order_by(GenSession.created_at.desc())
+                .limit(1)
+            )
+            session_id = result.scalar_one_or_none()
+        if session_id:
+            await self.save_attachment(session_id, attachment)
+
+    async def get_attachment(self, file_id: str):
+        """从 attachment 表按 file_id 查询。"""
+        from sinan.models.tables import Attachment
+        from sqlalchemy import select as _select
+        async with AsyncSessionLocal() as db:
+            return (
+                await db.execute(_select(Attachment).where(Attachment.file_id == file_id))
+            ).scalar_one_or_none()
 
 
 # 模块级单例，路由和 runner 直接 import 使用

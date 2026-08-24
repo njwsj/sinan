@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # --- Storage ---
     storage_type: str = "local"
     storage_local_path: str = "./output/pages"
+    storage_base_path: str = "./output/storage"
     attachment_storage_path: str = "/tmp/sinan_attachments"
 
     # --- BOS ---

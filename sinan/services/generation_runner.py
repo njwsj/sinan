@@ -340,18 +340,53 @@ class GenerationRunner:
             await db.commit()
 
     async def _hydrate_attachments(self, attachments: list) -> list[dict]:
-        """从本地 JSON 文件加载 Excel 完整数据，填入 parsed 字段。"""
+        """加载附件解析数据，优先从 attachment 表 + LocalStorage 读取，旧路径兜底。
+
+        优先级：
+        1. attachment 表有 meta.storage_uri → 从 LocalStorage 读解析 JSON
+        2. 旧路径兜底：settings.attachment_storage_path/{file_id}.json
+        3. 都没有 → 原样返回，不阻断流水线
+        """
+        from sinan.services.storage import storage as _storage
+
         hydrated: list[dict] = []
         for att in (attachments or []):
-            file_id = att.get("file_id", "")
-            json_path = Path(settings.attachment_storage_path) / f"{file_id}.json"
-            if json_path.exists():
-                parsed = json.loads(json_path.read_text(encoding="utf-8"))
-                hydrated.append({**att, "parsed": parsed})
-                logger.info("hydrated attachment: file_id=%s rows=%d", file_id, parsed.get("row_count", 0))
-            else:
-                logger.warning("attachment file not found, skipping: file_id=%s", file_id)
+            file_id = att.get("file_id") or ""
+            if not file_id:
                 hydrated.append(att)
+                continue
+
+            parsed = None
+
+            # —— 方式 1：attachment 表 + LocalStorage ——
+            try:
+                record = await session_store.get_attachment(file_id)
+                if record and record.meta:
+                    uri = record.meta.get("storage_uri") or ""
+                    if uri:
+                        key = uri.removeprefix("local://")
+                        raw = await _storage.get(key)
+                        parsed = json.loads(raw.decode("utf-8"))
+            except Exception as e:
+                logger.debug("attachment 表读取失败 file_id=%s: %s，尝试旧路径", file_id, e)
+
+            # —— 方式 2：旧本地文件兜底 ——
+            if parsed is None:
+                json_path = Path(settings.attachment_storage_path) / f"{file_id}.json"
+                if json_path.exists():
+                    parsed = json.loads(json_path.read_text(encoding="utf-8"))
+                    logger.info("attachment 用旧路径加载: file_id=%s", file_id)
+
+            if parsed is not None:
+                hydrated.append({**att, "parsed": parsed})
+                logger.info(
+                    "hydrated attachment: file_id=%s rows=%d",
+                    file_id, parsed.get("row_count", 0),
+                )
+            else:
+                logger.warning("attachment 无法加载，原样传入: file_id=%s", file_id)
+                hydrated.append(att)
+
         return hydrated
 
 

@@ -9,9 +9,9 @@
 
 与参考的差异（记入兼容矩阵）：
 - 参考另有 harness_checkpoint 表做双层 checkpoint（MySQL + Redis），
-  sinan 没有该表，checkpoint 仍由 LangGraph 的 MemorySaver 承担，
-  持久化 checkpoint 待 Step 9（storage/artifact_store）统一收口；
-- 参考写 BOS，sinan 当前只写 content 列（bos_path 留空）。
+  sinan 没有该表，checkpoint 仍由 LangGraph 的 MemorySaver 承担；
+  Step 9 已迁到 artifact_store，大内容通过 LocalStorage 卸载，bos_path 写 storage_uri；
+- 参考写 BOS，sinan 使用 LocalStorage（storage_type=local）。
 """
 from __future__ import annotations
 
@@ -19,13 +19,11 @@ import json
 import logging
 from functools import wraps
 
-from sqlalchemy import func, select
+from sinan.services.artifact_store import artifact_store
 
 from sinan.harness.contracts import ContractValidator
 from sinan.harness.gates import GateEngine
-from sinan.models.database import AsyncSessionLocal
 from sinan.models.enums import PipelineState
-from sinan.models.tables import GenerationArtifact
 from sinan.services.session_store import session_store
 
 logger = logging.getLogger(__name__)
@@ -162,32 +160,12 @@ async def _persist(state: dict, step: PipelineState, result: dict) -> None:
     content = result.get(key)
     if not isinstance(content, dict) or not content:
         return
+    marker = state.get("marker")
     try:
-        await _save_artifact(session_id, artifact_type, content)
+        await artifact_store.save_artifact(
+            session_id, artifact_type, content, marker=marker,
+        )
     except Exception:
         logger.exception("harness: artifact 写入失败 session_id=%s type=%s",
                          session_id, artifact_type)
 
-
-async def _save_artifact(session_id: str, artifact_type: str, content: dict) -> None:
-    """按 (session_id, artifact_type) 递增 version 写入 generation_artifact。
-
-    Step 9 会把这段挪进 services/artifact_store.py 并支持 BOS，这里先内联，
-    避免 Step 7 无谓地引入新 service 层。
-    """
-    async with AsyncSessionLocal() as db:
-        current = await db.execute(
-            select(func.coalesce(func.max(GenerationArtifact.version), 0)).where(
-                GenerationArtifact.session_id == session_id,
-                GenerationArtifact.artifact_type == artifact_type,
-            )
-        )
-        version = int(current.scalar() or 0) + 1
-        db.add(GenerationArtifact(
-            session_id=session_id,
-            artifact_type=artifact_type,
-            version=version,
-            content=json.dumps(content, ensure_ascii=False),
-            meta={"format": content.get("_format", "json")},
-        ))
-        await db.commit()

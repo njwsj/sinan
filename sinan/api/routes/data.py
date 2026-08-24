@@ -33,7 +33,7 @@ async def upload_data_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="文件超过 10MB 限制")
 
     try:
-        meta = await data_service.parse_and_store(
+        meta = await data_service.parse_and_store_legacy(
             file_data=file_data,
             storage_dir=settings.attachment_storage_path,
         )
