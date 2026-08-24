@@ -28,15 +28,18 @@
 - 产物：Step 9 起由 `services/artifact_store.ArtifactStore.save_artifact()` 统一写入，`harness/orchestrator._persist()` 调用它；内容 < 64KB 写 `content` 列，>= 64KB 通过 `LocalStorage` 卸载到 `./output/storage/artifacts/`，`bos_path` 记 `local://...` URI。落库失败只记日志，不打断流水线。
 - 附件：Step 9 起由 `/api/page/upload` → `data_service.parse_and_store()` → `session_store.save_attachment()` 写 `attachment` 表；原始文件和解析 JSON 均落 LocalStorage（`./output/storage/attachments/`）；`session.attachments` 由完整元数据对象改为 file_id 字符串列表；runner `_hydrate_attachments` 优先查表，旧 `/tmp/sinan_attachments/` 路径降为兜底。
 - 读取：`page_version` 只提供快照字段，页面级状态（status/current_version/published_version）统一从 `page` 主表读（`api/routes/pages.py`、`api/routes/preview.py`）。
+- 发布：Step 10 起 `api/routes/hosting.py:publish_page` → `page_service.publish_page()` → `page_store.publish()`，写 `page.published_version` + `status=published`；`unpublish_page` 逆向写 `status=preview` + 清 `published_version`；`rollback_version` 只移动 `page.current_version` 指针。
+- 安全扫描结果：Step 10 起 `hosting.py:_write_scan_result()` 在手动上传完成后写 `page_version.security_scan`（1=通过/2=拦截）和 `scan_result`（JSON 文本）。
 
 ## 遗留项
 
-- `page_version.bos_path` 仍为空，正文仍在 `html_content`；Step 9 已建好 StorageBackend 基础，Step 10 完成 page_service 后统一写入；
+- `page_version.bos_path` 仍为空，正文仍在 `html_content`；Step 10 已建好 page_service，但生成流水线仍写 html_content；bos_path 收紧为非空待 Step 15 验收前完成；
 - `skill_definition`、`page_template` 只建表，无写入点（Step 11/12）；
 - `harness/validators/browser_validator.py` 自 Step 7 起无引用点，渲染校验已收敛到 `harness/validators/render.py`；文件保留待 Step 13 复用或删除；
 - `gen_session_step.contract_result` / `gate_decision` 两列仍无写入点：契约违规现存于 state 的 `contract_errors`（不落库），门禁决策落 `gen_session.gate_reports`；
-- `page.description`/`cover_url`/`tags`/`allowed_datasources`/`last_gate_report` 与 `page_version.source_code`/`security_scan`/`scan_result` 均无写入点（Step 10/15）；
-- `/api/storage/{key}` 路由尚未注册（`LocalStorage.signed_url` 返回此路径），Step 10 完善 preview 路由时一并添加；
+- `page.description`/`cover_url`/`tags`/`allowed_datasources`/`last_gate_report` 与 `page_version.source_code` 仍无写入点（待 Step 15）；
+- `page_version.security_scan`/`scan_result`：Step 10 ✅ 已在 `hosting.py:_write_scan_result()` 写入（手动上传 HTML/ZIP 流程）；生成流水线仍未写入，待 Step 15 补全；
+- `/api/storage/{key}` 路由：Step 10 ✅ 已在 `api/routes/preview.py` 新增 `storage_router`，`GET /api/storage/{key:path}` 从 LocalStorage 读文件返回；
 - `attachment.user_id` 列在 upload 路由写入时恒为空，依赖 Step 3 认证完善后补充；
 - `gen_session.attachments` 的历史数据格式为完整元数据对象，Step 9 后新写入改为 file_id 列表；两种格式已在 `save_attachment` 和 `_hydrate_attachments` 中兼容处理；
 - 旧库 `sinan` 的历史 Session/PageVersion 在新库中不可见，未做数据迁移（学习项目有意跳过）；

@@ -22,7 +22,9 @@ from sinan.api.routes.generate import (
 from sinan.api.routes.preview import (
     router as preview_router,
     page_router as preview_page_router,
+    storage_router,
 )
+from sinan.api.routes.hosting import router as hosting_router
 from sinan.api.routes.session import router as session_router
 from sinan.api.routes.pages import router as pages_router
 from sinan.api.routes.upload import router as upload_router
@@ -88,7 +90,8 @@ def create_app() -> FastAPI:
     app.include_router(pages_router)
     app.include_router(preview_page_router)
     app.include_router(upload_router)
-
+    app.include_router(hosting_router)  # Step 10：托管 + 发布/取消/回滚
+    app.include_router(storage_router)  # Step 10：服务 LocalStorage 文件
     # 旧接口，过渡期保留
     app.include_router(legacy_health_router)
     app.include_router(legacy_generate_router)

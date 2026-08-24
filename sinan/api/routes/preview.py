@@ -1,6 +1,8 @@
 # sinan/api/routes/preview.py
+import mimetypes
+
 from fastapi import APIRouter
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response as _RawResponse
 from sqlalchemy import select, desc
 from sinan.models.database import AsyncSessionLocal
 from sinan.models.tables import Page, PageVersion
@@ -141,3 +143,63 @@ async def preview_version_compat(marker: str, version: int):
             status_code=404,
         )
     return HTMLResponse(content=page.html_content or "")
+
+# ============================================================
+# Step 10：live 预览（生成中自动刷新）
+# 对齐参考 page/api/routes/preview.py:64
+# ============================================================
+@page_router.get("/preview/{marker}/live/{session_id}", response_class=HTMLResponse)
+async def preview_live(marker: str, session_id: str):
+    """实时预览（每 3s 自动刷新，用于生成中的客户端轮询）。"""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PageVersion)
+            .where(PageVersion.marker == marker)
+            .order_by(desc(PageVersion.version))
+            .limit(1)
+        )
+        pv = result.scalar_one_or_none()
+
+    code = (pv.html_content or "") if pv else ""
+    refresh_script = (
+        '<script>setTimeout(function(){location.reload();},3000);</script>'
+    )
+    if code:
+        # 注入在 </body> 之前
+        html = code.replace("</body>", f"{refresh_script}</body>", 1)
+        if refresh_script not in html:
+            html = code + refresh_script
+    else:
+        html = (
+            f"<html><body><p>正在生成中，请稍候…</p>{refresh_script}</body></html>"
+        )
+    return HTMLResponse(content=html)
+
+
+# ============================================================
+# Step 10：服务 LocalStorage 文件（解决 signed_url 遗留项）
+# LocalStorage.signed_url() 返回 /api/storage/{key}，此处注册真实服务
+# ============================================================
+storage_router = APIRouter(tags=["storage"])
+
+
+@storage_router.get("/api/storage/{key:path}")
+async def serve_storage_file(key: str):
+    """开发模式下服务 LocalStorage 文件。
+
+    LocalStorage.signed_url(key) 返回 /api/storage/{key}；
+    此端点读取文件并以正确 MIME 类型返回，供预览页面加载静态资源。
+    """
+    from sinan.services.storage import storage
+    try:
+        data = await storage.get(key)
+    except (FileNotFoundError, ValueError) as e:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"文件不存在: {key}"},
+        )
+    mime, _ = mimetypes.guess_type(key)
+    return _RawResponse(
+        content=data,
+        media_type=mime or "application/octet-stream",
+    )

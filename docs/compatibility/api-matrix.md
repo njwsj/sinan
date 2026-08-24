@@ -70,7 +70,7 @@
 | GET | `/api/v1/generate/{session_id}/audit` | 否 | 步骤审计 | `sinan/api/routes/audit.py:11` | 保留 |
 | POST | `/api/v1/data/upload` | 否 | 本地附件解析 | `sinan/api/routes/data.py:11` | 保留 |
 | GET | `/api/page/session/{session_id}` | 否（Step 3 加认证） | 桩实现，待 Step 4 填充 | `sinan/api/routes/session.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
-| GET | `/api/page/pages/{marker}/versions` | 否（Step 3 加认证） | 桩实现，待 Step 10 填充 | `sinan/api/routes/pages.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
+| GET | `/api/page/pages/{marker}/versions` | 否（Step 3 加认证） | 桩实现，待 Step 10 填充 | `sinan/api/routes/pages.py`（Step 1 待实施） | **Step 10 已实现**（含 published_version/harness_score 等完整字段，格式 `{"code":0,"data":{...}}`） |
 | POST | `/api/page/upload` | 否（Step 3 加认证） | 桩实现，待 Step 9 填充 | `sinan/api/routes/upload.py`（Step 1 待实施） | **Step 1 待实施（桩）** |
 
 ## Step 8 新增会话动作 API（方案就绪，待实施）
@@ -106,8 +106,24 @@ sinan 落地位置统一在 `sinan/api/routes/session.py`（已注册于 `app.py
 | 生成 API 主路径 `/api/page/generate` | 缺失 | 已实现（`generate.py:68`，直接返回 SSE） | 需运行 `curl -N POST /api/page/generate` 确认流式响应 |
 | `prompt` 最小长度校验（min=2） | 无约束 | 已实现（`contracts.py:65` `Field(..., min_length=2)`，与参考一致） | 需运行空/单字符 prompt 确认 422 |
 | `session_id`/`marker`/`mode` 等字段 | 缺失 | 已实现（`contracts.py:64-78`，字段集与参考完全一致） | 字段接收，内部暂不使用 |
-| 预览路径 `/api/page/preview/{marker}`、`/v{version}` | 缺失 | **待实施**（现仅有 `/api/v1/page/{marker}`） | 添加兼容路由后访问确认 HTML 响应 |
+| 预览路径 `/api/page/preview/{marker}`、`/v{version}` | 缺失 | 已实现（`preview.py:page_router`） | - |
 | 认证 | 无 | 无（Step 3 加） | 仍待解决 |
 | Session/Job/确认/取消/恢复 API | 缺失 | **待实施**（session/pages/upload 桩文件尚未创建） | 待 Step 1 建桩、Step 4-10 实现 |
 | `POST /api/page/generate` SSE 使用内存 Queue | — | 已替换为 Redis List 持久化事件流（Step 5），`Last-Event-ID`/`cursor` 断线续传，`ping=30` | 需 curl 断线重连确认不丢不重 |
 | SSE 事件 ID 与回放 | 无 ID、无回放 | 已实现（`models/events.py`、`services/generation_event_bus.py`） | 待 Step 15 双项目 SSE 原文对照 |
+
+## Step 10 新增 API
+
+| 方法 | 路径 | 认证 | 行为 | 位置 | 状态 |
+|---|---|---|---|---|---|
+| POST | `/api/page/host` | 否（Step 3 加） | 上传 HTML/ZIP，安全扫描，写 page_version；返回 preview_url | `api/routes/hosting.py` | **Step 10 已实现** |
+| POST | `/api/page/pages/{marker}/publish` | 否（Step 3 加） | 发布指定版本，写 published_version + status=published | `hosting.py` + `page_service.publish_page` | **Step 10 已实现** |
+| POST | `/api/page/pages/{marker}/unpublish` | 否（Step 3 加） | 取消发布，status 回退 preview，清 published_version | `hosting.py` + `page_service.unpublish_page` | **Step 10 已实现** |
+| POST | `/api/page/pages/{marker}/rollback` | 否（Step 3 加） | 回滚 current_version 指针，不删历史版本 | `hosting.py` + `page_service.rollback_version` | **Step 10 已实现** |
+| GET | `/api/page/preview/{marker}/live/{session_id}` | 否 | 生成中实时预览，每 3s 自动刷新 | `preview.py:preview_live` | **Step 10 已实现** |
+| GET | `/api/storage/{key:path}` | 否 | 服务 LocalStorage 静态文件（`signed_url` 遗留项） | `preview.py:storage_router` | **Step 10 已实现** |
+| GET | `/api/page/pages/{marker}/data` | 否（Step 3 加） | marker 关联附件列表 | `pages.py:get_page_data` | **Step 10 已实现** |
+| GET | `/api/page/pages/{marker}/download/{file_id}` | 否（Step 3 加） | 下载附件文件 | `pages.py:download_page_attachment` | **Step 10 已实现** |
+| GET | `/api/page/pages/{marker}/messages` | 否（Step 3 加） | marker 关联会话消息列表 | `pages.py:get_page_messages` | **Step 10 已实现** |
+| GET | `/api/page/pages/{marker}/artifacts` | 否（Step 3 加） | 流水线产物列表 | `pages.py:get_page_artifacts` | **Step 10 已实现** |
+| GET | `/api/page/pages/{marker}/artifacts/{artifact_type:path}` | 否（Step 3 加） | 下载特定产物 JSON | `pages.py:download_page_artifact` | **Step 10 已实现** |
