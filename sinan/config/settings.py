@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     opencode_enabled: bool = False
     opencode_base_url: str = ""
     opencode_mode: str = "opencode"
+    claude_code_backend: str = "native"      # Step 13：目前只支持 "native"
 
     # --- Feature / Job ---
     max_generation_attempts: int = 3

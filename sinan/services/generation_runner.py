@@ -33,6 +33,8 @@ class GenerationRunner:
     def __init__(self, llm: LLMClient):
         self.llm = llm
         self.graph = build_graph(llm)
+        from sinan.runtime.registry import RuntimeRegistry
+        self._runtime_registry = RuntimeRegistry(self.graph)
 
 
     async def _build_state(self, job, session, *, action: str, body: dict) -> dict:
@@ -178,33 +180,22 @@ class GenerationRunner:
 
 
     async def _run_graph(self, job, initial_state: dict, session) -> None:
-        """跑一遍 LangGraph 图并处理结果：消费事件 → 挂起分支 → 校验 → 落版本 → 发 completed。
+        """通过 RuntimeRegistry 路由到对应 Runtime，消费 RuntimeEvent → SSE。
 
         generate / confirm / iterate 三条路径共用，差异只体现在传入的 initial_state。
-        initial_state 必须已包含 session_id / job_id / marker / user_input / attachments 等字段
-        （由 _build_state 构造）。session 用于取 user_id / prompt / title。
         """
         session_id = job.session_id
         resolved_marker = initial_state.get("marker") or f"page_{session_id[:8]}"
-
-        step_labels = {
-            "router": "正在识别需求意图...",
-            "skill": "正在准备外部资料...",  # Step 12
-            "analyst": "正在分析需求...",
-            "designer": "正在制定设计方案...",
-            "coder": "AI 正在生成页面代码...",
-            "verifier": "正在验证页面...",
-            "fixer": "正在修复问题...",
-        }
+        mode = (job.request_payload or {}).get("mode") or "native"
+        runtime = self._runtime_registry.get(mode)
 
         try:
-            final_state = None
-            async for event in self.graph.astream_events(
-                    initial_state,
-                    config={"configurable": {"thread_id": session_id}},
-                    version="v2",
+            final_state: dict | None = None
+
+            async for rt_event in runtime.run_generation(
+                initial_state, thread_id=session_id
             ):
-                # —— 运行中取消检测（节点边界，跨实例） ——
+                # —— 取消检测（节点边界） ——
                 if await cancel_registry.is_cancelled_async(session_id):
                     await generation_job_store.request_cancel(job_id=job.job_id)
                     await session_store.update(
@@ -217,31 +208,35 @@ class GenerationRunner:
                         session_id, events.CANCELLED, events.cancelled_data(),
                         job_id=job.job_id, marker=resolved_marker,
                     )
-                    return  # 正常返回，run_job 复查到 cancelled 不置 completed
+                    return
 
-                kind = event["event"]
-                name = event.get("name", "")
+                # —— RuntimeEvent → SSEEvent ——
+                if rt_event.type == "step":
+                    node_name = rt_event.data.get("agent") or rt_event.data.get("step", "")
+                    await event_bus.publish(
+                        session_id, events.STEP,
+                        events.step_data(
+                            node_name,
+                            rt_event.data.get("message", ""),
+                            node_name,
+                        ),
+                        job_id=job.job_id, marker=resolved_marker,
+                    )
+                    await self._write_step(session_id, node_name,
+                                           rt_event.data.get("message", f"开始{node_name}"))
 
-                if kind == "on_chain_start":
-                    node_name = event.get("metadata", {}).get("langgraph_node", "")
-                    if node_name in step_labels:
-                        await event_bus.publish(
-                            session_id, events.STEP,
-                            events.step_data(node_name, step_labels[node_name], node_name),
-                            job_id=job.job_id, marker=resolved_marker,
-                        )
-                        await self._write_step(session_id, node_name, f"开始{node_name}")
+                elif rt_event.type == "graph_output":
+                    final_state = rt_event.data
 
-                elif kind == "on_chain_end":
-                    if event.get("run_id") and name == "LangGraph":
-                        final_state = event["data"].get("output")
+            if final_state is None:
+                raise ValueError("Runtime 未产生 graph_output 事件，生成流程异常终止")
 
             fix_round = final_state.get("fix_round", 0)
             verification = final_state.get("verification_result") or {}
             quality_score = float(verification.get("quality_score") or 0.0)
             issues = verification.get("issues") or []
 
-            # 低置信度挂起：图在 analyst 之后就 END 了，没有 code
+            # 低置信度挂起
             if final_state.get("status") == "awaiting_confirmation":
                 link_required = bool(final_state.get("skill_link_required"))
                 await session_store.update(
@@ -272,7 +267,7 @@ class GenerationRunner:
                     job_id=job.job_id, marker=resolved_marker,
                 )
                 await generation_job_store.mark_waiting(job.job_id, _OWNER)
-                return  # Job 落 waiting，等确认接口恢复
+                return
 
             verify_message = (
                 "校验通过" if verification.get("passed")
@@ -305,7 +300,7 @@ class GenerationRunner:
             )
             return
 
-        # 托管：写 page_version 表，更新 session
+        # 落版本
         version = await page_store.next_version(resolved_marker)
         await page_store.save(
             marker=resolved_marker,

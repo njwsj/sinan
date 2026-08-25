@@ -1,2 +1,7 @@
 # sinan/runtime/__init__.py
-"""运行时相关模块。Step 12 只有 tool_registry；Step 13/14 在此加 Runtime 抽象。"""
+"""Runtime 抽象层：Step 13 起启用。"""
+from sinan.runtime.events import RuntimeEvent
+from sinan.runtime.base import GenerationRuntime
+from sinan.runtime.registry import RuntimeRegistry
+
+__all__ = ["RuntimeEvent", "GenerationRuntime", "RuntimeRegistry"]

@@ -2152,6 +2152,28 @@ page/claude_code/tool_registry.py
 - 生成结果保存为同样的 PageVersion/Artifact；
 - 同一个 Prompt 的 Runtime 选择符合原项目规则。
 
+## 实施结论（2026-08-25，代码已落地）
+
+**新增文件：**
+- `sinan/runtime/events.py`：`RuntimeEvent` dataclass（对齐 `page/claude_code/events.py`）
+- `sinan/runtime/base.py`：`GenerationRuntime` Protocol，`@runtime_checkable`
+- `sinan/runtime/native.py`：`NativeLangGraphRuntime`，将 `astream_events v2` 翻译为 `RuntimeEvent` 流
+- `sinan/runtime/registry.py`：`RuntimeRegistry`，按 `mode` 路由；未知 mode 降级 native 并 warning
+- `sinan/claude_code/__init__.py`：包文件
+- `sinan/claude_code/runtime.py`：`ClaudeCodeRuntime`，当前底层为 `NativeLangGraphRuntime`，对齐 `page/claude_code/runtime.py` 接口
+
+**修改文件：**
+- `sinan/runtime/__init__.py`：从占位注释改为正式导出 `RuntimeEvent / GenerationRuntime / RuntimeRegistry`
+- `sinan/config/settings.py`：在 `# --- Runtime ---` 分组新增 `claude_code_backend: str = "native"`
+- `sinan/services/generation_runner.py`：
+  - `__init__` 初始化 `RuntimeRegistry`
+  - `_run_graph` 改为通过 `RuntimeRegistry.get(mode)` 路由 Runtime，消费 `RuntimeEvent`（`step` / `graph_output`）而非直接调用 `astream_events`
+
+**有意的差异：**
+- `ClaudeCodeRuntime` 底层仍是 native 图，未重写 `CodegenEngine` 手动链式调用，因为 sinan 的 LangGraph 图节点已与参考对齐，功能等价
+- `NativeLangGraphRuntime.resume()` 返回 `runtime_error` 事件（无 checkpoint store），Step 14 引入真实 checkpoint 时再实现
+- skill 节点保留在图中，未下移到 runtime 层（参考做法），Step 14 对照时再评估
+
 ---
 
 # Step 14：对齐 Opencode 和 Hybrid Runtime
