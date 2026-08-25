@@ -41,6 +41,7 @@ ANALYSIS_RESULT = "analysis_result" # 需求分析完成（流结束）
 DESIGN_DELTA = "design_delta"       # 设计方案 token 增量（流式）
 DESIGN_RESULT = "design_result"     # 设计方案完成（流结束）
 SKILL_RUNNING = "skill_running"     # Skill 执行中（Step 12 实现）
+SKILL_LINK_REQUIRED = "skill_link_required"     # Skill 需要用户补充链接（Step 12）
 SKILL_RESULT = "skill_result"       # Skill 执行结果（Step 12 实现）
 KNOWLEDGE_SOURCE = "knowledge_source"           # 知识库摄取（Step 12 实现）
 AWAITING_CONFIRMATION = "awaiting_confirmation" # 等待用户确认（终止当前 SSE）
@@ -271,3 +272,52 @@ def analysis_delta_data(delta: str, accumulated_len: int) -> dict:
 def design_delta_data(delta: str, accumulated_len: int) -> dict:
     """设计方案 token 增量事件。"""
     return {"delta": delta, "accumulated_len": accumulated_len}
+
+def skill_running_data(skill_keys: list[str], explicit: bool,
+                       message: str = "调用外部工具") -> dict:
+    """Skill 开始执行。explicit=True 表示来自请求里的 skill_keys，False 表示按 Prompt 路由命中。
+
+    参考在 codegen_engine 里发的是 step 事件（step="skill_running"），sinan 用独立事件名，
+    因为 sinan 的 step 事件语义已固定为「图节点进入」，混用会污染前端的节点进度条。
+    """
+    return {"skill_keys": list(skill_keys), "explicit": bool(explicit), "message": message}
+
+
+def skill_result_data(skill_key: str, name: str, success: bool, content: str,
+                      *, error: str = "", output_type: str = "data",
+                      preview_limit: int = 2000) -> dict:
+    """Skill 执行结果。content 超过 preview_limit 时只发前缀，完整内容留在 state/Artifact。
+
+    字段名对齐参考 page/api/runtime_stream.py:375 的 skill_result payload。
+    """
+    text = content or ""
+    d: dict = {
+        "skill_key": skill_key,
+        "name": name or skill_key,
+        "success": bool(success),
+        "output_type": output_type,
+    }
+    if len(text) > preview_limit:
+        d["content_preview"] = text[:preview_limit]
+        d["truncated"] = True
+        d["content_length"] = len(text)
+    else:
+        d["content"] = text
+        d["truncated"] = False
+    if error:
+        d["error"] = error
+    return d
+
+
+def skill_link_required_data(message: str, skill_keys: list[str] | None = None) -> dict:
+    """Skill 需要用户补充资源链接（知识库 URL 等）。随后会发一条 awaiting_confirmation。"""
+    return {"message": message, "skill_keys": list(skill_keys or []), "link_required": True}
+
+
+def knowledge_source_data(source: str, success: bool, *, title: str = "",
+                          chars: int = 0, error: str = "") -> dict:
+    """单条知识库来源的摄取结果。source 是原始入参（本地路径或 URL）。"""
+    d = {"source": source, "success": bool(success), "title": title, "chars": chars}
+    if error:
+        d["error"] = error
+    return d

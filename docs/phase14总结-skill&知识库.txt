@@ -1,0 +1,65 @@
+一. 新增
+	1.skill_package.py:扫描 settings.skills_dir 下的目录，把 SKILL.md 解析成可落库的字段。
+	2.skill_registry.py:skill_definition 表的唯一读写入口。skill_package 只认文件系统，skill_registry 只认数据库
+	3.admin_skills.py:skill相关的接口
+	4.tool_registry.py:列出可用 Skill / 按场景过滤 / 解析显式 skill_keys / 按 Prompt 路由 / 执行 / 归一化输出。
+	5.document_parser.py：md/txt/json/html/csv/xlsx 各按格式转成可注入 prompt 的文本。
+	6.knowledge_context.py:知识库摄取,校验 → 读取 → 解析 → 限长 → 清洗 → 落 Artifact → 注入 state
+	7.skill_agent:把上面所有能力串成一个 LangGraph 节点。
+二、skill流程
+	1.参数进state：
+		POST /api/page/generate
+		  → generate.py: _create_or_reuse_generation()
+		      payload = req.model_dump()        skill_keys / knowledge_sources / datasources 都在里面
+		      create_or_get_job(payload=payload)
+		      publish(session_init)
+		      ensure_job_running(job_id)        后台跑，请求本身直接返回 SSE 流
+		  → runner.run_job() → _execute_generation_pipeline() → _build_state()
+		      state["skill_keys"]         = payload["skill_keys"]
+		      state["knowledge_sources"]  = payload["knowledge_sources"]
+		      state["datasource_context"] = await data_service.resolve_datasources(...)   ← 数据源在这里就取完了
+		  → _run_graph(job, state, session)
+	2.skill节点执行：
+		router 节点（意图分类）
+		  → publish step{step:"skill", message:"正在准备外部资料..."}
+		  → skill 节点 SkillAgent.run(state)
+		      │
+		      ├─ 0. external_knowledge_loaded 已置位？→ 直接 return {}（续跑时防重复）
+		      │
+		      ├─ 1. tool_registry.select(prompt, skill_keys)
+		      │       list_available()        查表 enabled + 校验 handler 存在
+		      │       resolve_explicit()      显式命中 → _source=explicit，直接返回
+		      │       route_by_keywords()     显式为空 → 关键词匹配
+		      │
+		      ├─ 2. needs_link() 检查
+		      │       user_confirmed=True → 跳过（防死循环）
+		      │       requires_link 的 Skill 没链接，或 Prompt 提知识库但没链接
+		      │         → publish skill_link_required
+		      │         → return {status:"awaiting_confirmation", skill_link_required:True}
+		      │         → _after_skill 走 END，图终止（见阶段 6）
+		      │
+		      ├─ 3. load_knowledge_sources()  有 knowledge_sources 才跑
+		      │       逐条：校验 → 读取 → parse_bytes → truncate → publish knowledge_source
+		      │       合并 → 落 artifact_type="knowledge"
+		      │
+		      ├─ 4. publish skill_running{skill_keys, explicit}
+		      │     for skill in selected:              串行，保证事件顺序稳定
+		      │         tool_registry.execute()          子进程 + 超时 + 归一化
+		      │         publish skill_result{success, content 或 content_preview}
+		      │         成功 → 落 artifact_type="skill_{skill_key}"
+		      │
+		      └─ 5. 合并成 external_knowledge，写回 state
+              "## 知识库资料\n\n..." + "## Skill 输出：xxx\n\n..."
+    3.资料被真正用上：
+    	analyst 节点
+		  build_analyst_context():
+		    context += "外部资料（来自知识库与 Skill，请据此推导数据字段，不要凭空编造字段）:\n" + external
+		  → 需求分析里的「数据字段清单」基于 Skill 返回的真实列名
+
+		designer 节点 → coder 节点
+		  user_content += "外部资料（知识库 + Skill 输出）。若其中含表格或 rows 数据，
+		                   必须直接用于图表 series data，字段名保持一致，禁止编造数值：\n" + external
+		  user_content += _build_datasource_context(state["datasource_context"])
+		  → 生成的 HTML 里 ECharts series data 是真实数值
+
+		verifier → (fixer) → 落 page_version → publish completed

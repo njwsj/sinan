@@ -58,10 +58,23 @@ class GenerationState(TypedDict, total=False):
     user_confirmed: bool | None
     iteration_feedback: str | None
 
-    # ---- 模板 / Skill / 知识库（Step 11、12 起使用，本 Step 占位）----
+    # ---- 模板（Step 11）----
     template_id: str | None
     template_code: str | None
-    skill_context: dict | None
-    knowledge_context: dict | None
-    external_knowledge: str | None
+
+    # ---- Skill / 知识库 / 数据源（Step 12 起真正使用）----
+    skill_keys: list[str]  # 请求显式指定的 skill_key（强制选择）
+    selected_skills: list[dict]  # 本次实际选中的 Skill（含来源 explicit/routed）
+    skill_results: list[dict]  # 每个 Skill 的归一化结果，追加写
+    skill_result: str | None  # 最近一次成功 Skill 的正文（对齐参考同名键）
+    skill_link_required: bool | None  # True 表示因缺链接挂起，图在 skill 节点后 END
+    skill_context: dict | None  # {selected, results, ok_count, failed}
+
+    knowledge_sources: list[str]  # 待摄取的本地路径 / URL
+    knowledge_context: dict | None  # {items: [...], ok_count, chars}
+    external_knowledge: str | None  # 合并清洗后注入 prompt 的知识正文
+    external_knowledge_loaded: bool | None  # 防止 confirm/iterate 续跑时重复抓取
+
+    datasource_context: dict | None  # data_service.resolve_datasources() 的结果
+
     force_auto_confirm: bool | None

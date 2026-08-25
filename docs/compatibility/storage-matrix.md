@@ -15,7 +15,7 @@
 | Artifact | 参考 `GenerationArtifact`，支持类型和内容读取；写入在 `harness/orchestrator._save_checkpoint()` 里经 `session_store.save_artifact()` 落 BOS + 表 | `generation_artifact`（Step 6 新增，`tables.py:137`），`metadata` 列以属性名 `meta` 映射（`metadata` 是声明式保留名）；Step 9 起迁到 `services/artifact_store.py` | Step 9 已解决 ✅：`artifact_store.save_artifact()` 写 `analysis`/`design`/`verification` 三类；内容 < 64KB 入 `content` 列，>= 64KB 卸载到 LocalStorage，`bos_path` 写 `local://...` URI；`code` 类型通过 `save_code_snapshot()` 提供写入点（Step 10 接入）；参考写 BOS，sinan 用 LocalStorage（待生产接入时切换 `storage_type=bos`）|
 | Harness checkpoint | 参考另有 `harness_checkpoint` 表 + Redis 双层 checkpoint（`page/harness/checkpoint.py`） | 无该表，checkpoint 仍由 LangGraph `MemorySaver` 承担 | 未对齐（已知差异）：进程重启后图内 checkpoint 丢失，恢复依赖 Job 重跑；Step 9 完成 artifact_store 后该差异收窄，但 harness_checkpoint 表本身不计划实现 |
 | 上传附件 | 参考上传服务 + `generation_session.attachments` JSON，无独立表 | `attachment`（Step 6 新增，`tables.py:234`）；Step 9 起有写入点 | Step 9 已解决 ✅：`/api/page/upload` 调用 `data_service.parse_and_store()` → LocalStorage → `session_store.save_attachment()` 写 attachment 表；`session.attachments` 改为 file_id 字符串列表；`_hydrate_attachments` 优先查 attachment 表，旧路径（`attachment_storage_path`）降为兜底；`attachment.user_id` 仍为空，待 Step 3 认证补充 |
-| Skill / Template | `skill_definition` / `page_template` | 同名表已建（Step 6，`tables.py:256,277`），无读写点 | 结构对齐，行为待 Step 11/12 |
+| Skill / Template | `skill_definition` / `page_template` | `page_template` Step 11 起有读写点；`skill_definition` Step 12 起有读写点（`services/skill_registry.py`） | 结构对齐 ✅；`bos_path` 列在 sinan 里存 `local://<本地包绝对路径>`，参考存 BOS zip URL——**已确认差异**（不新增列，避免重建库） |
 | sys_user / buddy_profile | 参考存在 | 不建表 | 有意不对齐：认证 Step 3 已定"暂不实现"；buddy 与页面生成无关 |
 | 事件 | Redis List，带 seq | Redis List + INCR seq（Step 5）：`sinan:generation:events:{sid}`，上限 1000 条，终止事件后 TTL 120s；本分支 `redis_db=1` | 持久化与回放已对齐 |
 | 迁移 | 由 DBA/外部管理 | 无迁移体系：开发期靠 `init_db()` 的 `create_all()`；Step 6 的模型升级采用「新建空库 + create_all」，旧库 `sinan` 原样保留 | 未对齐：Alembic 推迟到有真实数据需保留时再引入 |
@@ -30,11 +30,15 @@
 - 读取：`page_version` 只提供快照字段，页面级状态（status/current_version/published_version）统一从 `page` 主表读（`api/routes/pages.py`、`api/routes/preview.py`）。
 - 发布：Step 10 起 `api/routes/hosting.py:publish_page` → `page_service.publish_page()` → `page_store.publish()`，写 `page.published_version` + `status=published`；`unpublish_page` 逆向写 `status=preview` + 清 `published_version`；`rollback_version` 只移动 `page.current_version` 指针。
 - 安全扫描结果：Step 10 起 `hosting.py:_write_scan_result()` 在手动上传完成后写 `page_version.security_scan`（1=通过/2=拦截）和 `scan_result`（JSON 文本）。
+- Skill 定义：Step 12 起 `services/skill_registry.py` 是 `skill_definition` 的唯一写入点。启动时 `sync_enabled_skills()` 扫描 `settings.skills_dir`（默认 `./sinan/skills`，相对路径按**项目根**解析）把本地包 upsert；人工 `disabled` 的包不会被重启同步重新启用；缺 `handler.py` 的包落 `status=failed`，不会被 `tool_registry.list_available()` 选中。`POST /api/page/admin/skills/install` 手动安装单个包。**同步在 `start_supervisor()` 之前执行**，避免 supervisor 恢复遗留 Job 时 Skill 表还没同步完。
+- Skill / 知识库产物：Step 12 起 `agents/skill_agent.py` 把每个成功 Skill 的输出写成 `artifact_type="skill_{skill_key}"`（截断到 64 字符），`services/knowledge_context.py` 把合并清洗后的知识写成 `artifact_type="knowledge"`，都走 Step 9 的 `artifact_store.save_artifact()`（<64KB 入 `content` 列，否则卸到 LocalStorage）。落库失败只记日志，不打断流水线。
 
 ## 遗留项
 
 - `page_version.bos_path` 仍为空，正文仍在 `html_content`；Step 10 已建好 page_service，但生成流水线仍写 html_content；bos_path 收紧为非空待 Step 15 验收前完成；
-- `skill_definition`、`page_template` 只建表，无写入点（Step 11/12）；
+- `skill_definition`、`page_template` 只建表，无写入点（Step 11/12）→ **均已解决**：`page_template` Step 11 ✅、`skill_definition` Step 12 ✅；
+- `skill_definition.visibility` 恒为 `internal`（没有前端可见性配置入口），参考支持 `visibility=published` 供前端筛选可选 Skill——待前端需要时再补；
+- Skill 包本身不入库也不入对象存储，权威来源是文件系统（`sinan/skills/`，随 wheel 打包，`pyproject.toml` 的 `packages=["sinan"]` 已覆盖）；`knowledge/` 目录默认不存在，首次使用知识库功能时需手工创建并放入文件；
 - `harness/validators/browser_validator.py` 自 Step 7 起无引用点，渲染校验已收敛到 `harness/validators/render.py`；文件保留待 Step 13 复用或删除；
 - `gen_session_step.contract_result` / `gate_decision` 两列仍无写入点：契约违规现存于 state 的 `contract_errors`（不落库），门禁决策落 `gen_session.gate_reports`；
 - `page.description`/`cover_url`/`tags`/`allowed_datasources`/`last_gate_report` 与 `page_version.source_code` 仍无写入点（待 Step 15）；

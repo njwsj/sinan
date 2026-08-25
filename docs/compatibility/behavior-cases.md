@@ -24,8 +24,8 @@
 | 18 | 非法 ZIP | 有 | 缺失/待测 | 安全校验和 400 |
 | 19 | 页面模板 | 有 | 缺失 | template_id；`TemplateValidator` 已就位（Step 7），缺 `template_code` 注入（Step 11） |
 | 20 | Prompt Template | 有 | 缺失 | 模板列表/生成 |
-| 21 | Skill | 有 | 缺失 | skill_keys/admin API |
-| 22 | 知识库链接 | 有 | 缺失 | knowledge_sources |
+| 21 | Skill | 有 | 部分（Step 12） | 显式 `skill_keys` 强制选择、关键词路由、`skill_running`/`skill_result` 事件、失败不阻断。**差异**：sinan 从本地 `sinan/skills/` 目录装包（参考从 BOS zip）；sinan 打开了关键词路由（参考的 auto 路由被硬关，`codegen_engine.py:508`）|
+| 22 | 知识库链接 | 有 | 部分（Step 12） | `knowledge_sources` 本地文件解析 → `knowledge_source` 事件 → `knowledge` Artifact → `external_knowledge` 注入 analyst/coder。**差异**：HTTP 抓取默认关闭（`knowledge_allow_http=False`），参考默认走 httpx + ku 二进制 |
 | 23 | 页面预览 | 有 | 部分 | 路径、404、HTML |
 | 24 | 页面版本预览 | 有 | 部分 | version URL 和权限 |
 | 25 | 页面发布 | 有 host | 缺失 | publish/hosting 状态 |
@@ -47,3 +47,21 @@
 | 34 | 门禁报告 | 6 个门，报告 6 字段 | 部分 | `gen_session.gate_reports` 的 `gate`/`step`/`passed`/`score`；sinan 多 `decision`/`issues`/`timestamp` |
 | 35 | 修满轮次仍不通过 | complete_with_warnings 出口，`passed` 仍 False | 是 | Job/Session 是否都落 failed、`verify_result` payload 与错误文案 |
 | 36 | 低置信度挂起 | analyst confidence < 0.3 → awaiting_confirmation | 部分 | Session=paused、Job=waiting、事件 payload；参考 `pipeline_state` 写 `analysis`，sinan 写 `user_confirm` |
+
+## Step 12 新增基线用例
+
+标注「已本地实测」的项是用一次性自检脚本（已删除）直接调服务层/路由层验证过的；
+其余仍需与参考同输入对照。
+
+| ID | 场景 | 参考 | sinan 当前 | 验证重点 |
+|---:|---|---|---|---|
+| 37 | 显式 skill_keys 强制选择 | 有（`forced_skill_keys`） | 是（已本地实测） | `skill_keys=["static-sales"]` 时 `_source=explicit` 且不走路由；库里没有的 key 保留占位记录（`_source=explicit_missing`）并以 `ok=false, error="handler not found"` 结束——参考同样保留占位 |
+| 38 | Prompt 路由命中 Skill | 代码在但被硬关 | sinan 打开关键词路由（已本地实测） | "用模拟数据做个收入看板" → `mock-metrics`（命中词 `模拟数据`）；"做一个区域销售额看板" → `static-sales`；"做个时间页面" → 不选。`skill_running.explicit=false`。**已知差异**：参考此场景不会选任何 Skill |
+| 39 | Skill 执行失败 | 记录 + `skill_result.success=false`，不挂起 | 同（`tool_registry.execute` 全异常收敛） | handler 缺失 / 子进程超时（`skill_timeout_seconds`）/ 非零退出 / stdout 非 JSON 四种情况都应 `success=false` 且流水线继续；`skill_context.failed` 有记录 |
+| 40 | 缺链接挂起 | `skill_link_required` → 会话挂起 | 是（已本地实测分支） | 事件顺序必须是 `skill_link_required` → `awaiting_confirmation{link_required:true}`；Session=paused、Job=waiting；`_after_skill` 使图在 skill 节点后 END |
+| 41 | 补链接后续跑 | 用户补链接 → 继续 | 是 | `POST /session/{id}/confirm` 带 `link` 或 `knowledge_sources` → runner `_build_state` 合并 → 新 confirm Job 重跑 skill 节点真正加载知识。**sinan 增量**：`user_confirmed=True` 时跳过链接门，避免"确认但仍不给链接"导致无限挂起 |
+| 42 | 知识源非法 | SSRF / 不可达时降级 | 是（已本地实测） | `../../etc/passwd` → `路径越界`；`missing.md` → `文件不存在`；`http://127.0.0.1/x` → `HTTP 知识源已禁用`；三种都 `success=false` 且不阻断，合法源照常合并 |
+| 43 | Skill 输出落 Artifact | 有 | 是 | `generation_artifact` 应有 `skill_{skill_key}` 与 `knowledge` 两类记录，>=64KB 卸载到 LocalStorage（Step 9 机制） |
+| 44 | 数据源五类型 | api/static/database/file/mock | 4 类可用 + database 显式 unsupported（已本地实测） | 每条结果都带 `data_schema`/`sample_data`/`error_policy`；`db:` 返回"不支持执行"而非静默；`file:` 越界/缺失有明确 error |
+| 45 | Skill 跨用户隔离 | 有认证边界 | 结构上无越权面，但**未验证** | 子进程只透传 `PATH/LANG/LC_ALL/PYTHONPATH/HOME`，不注入任何凭证；`knowledge_context._resolve_local` 限定 `knowledge_dir` 前缀；`skill_dir` 拒绝含 `/`、`\`、前导 `.` 的 key。真实多用户隔离依赖 Step 3（已评估跳过） |
+| 46 | 本地包安装与状态 | 远端 zip 安装 | 是（已本地实测） | 启动 `sync_enabled_skills()` 把 `sinan/skills/` 两个包 upsert 为 `enabled`；人工 `disabled` 的包不会被重启同步重新启用；缺 `handler.py` 的包落 `failed` 且不被 `list_available()` 选中 |

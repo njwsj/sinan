@@ -1,0 +1,11 @@
+{
+  "columns": ["region", "category", "amount", "orders"],
+  "rows": [
+    {"region": "华北", "category": "服务器", "amount": 4200, "orders": 120},
+    {"region": "华北", "category": "存储", "amount": 1800, "orders": 64},
+    {"region": "华东", "category": "服务器", "amount": 5600, "orders": 151},
+    {"region": "华东", "category": "存储", "amount": 2400, "orders": 88},
+    {"region": "华南", "category": "服务器", "amount": 3100, "orders": 97},
+    {"region": "华南", "category": "存储", "amount": 1500, "orders": 52}
+  ]
+}

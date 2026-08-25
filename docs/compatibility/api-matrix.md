@@ -127,3 +127,27 @@ sinan 落地位置统一在 `sinan/api/routes/session.py`（已注册于 `app.py
 | GET | `/api/page/pages/{marker}/messages` | 否（Step 3 加） | marker 关联会话消息列表 | `pages.py:get_page_messages` | **Step 10 已实现** |
 | GET | `/api/page/pages/{marker}/artifacts` | 否（Step 3 加） | 流水线产物列表 | `pages.py:get_page_artifacts` | **Step 10 已实现** |
 | GET | `/api/page/pages/{marker}/artifacts/{artifact_type:path}` | 否（Step 3 加） | 下载特定产物 JSON | `pages.py:download_page_artifact` | **Step 10 已实现** |
+
+## Step 12 新增 API
+
+参考对应：`page/api/routes/admin_skills.py` 的 5 个端点（`:152,167,178,191,209`）。
+
+| 方法 | 路径 | 认证 | 行为 | 位置 | 状态 |
+|---|---|---|---|---|---|
+| GET | `/api/page/admin/skills` | 否（Step 3 已评估跳过） | 列出已入库 Skill（不含 content），支持 `status`/`visibility` 过滤 | `api/routes/admin_skills.py:list_skills` | **Step 12 已实现** |
+| GET | `/api/page/admin/skills/local` | 否 | **sinan 增量**：列出本地 `sinan/skills/` 下的包及是否已入库，附 `skills_dir` 绝对路径 | `admin_skills.py:list_local_skills` | **Step 12 已实现** |
+| POST | `/api/page/admin/skills/install` | 否 | 从本地目录安装（请求体 `{"skill_key": "..."}`）；包不存在 404，key 含路径分隔符 400 | `admin_skills.py:install_skill` | **Step 12 已实现** |
+| PATCH | `/api/page/admin/skills/{skill_key}/status` | 否 | 启用 / 停用；非 `enabled|disabled` 由 Pydantic 拦为 422 | `admin_skills.py:update_skill_status` | **Step 12 已实现** |
+| PATCH | `/api/page/admin/skills/{skill_key}` | 否 | 改 `output_type`/`name`/`description` | `admin_skills.py:update_skill` | **Step 12 已实现** |
+| DELETE | `/api/page/admin/skills/{skill_key}` | 否 | 删表记录（不删本地包目录） | `admin_skills.py:delete_skill` | **Step 12 已实现** |
+
+已用 httpx ASGITransport 实测：`/local` 200、list 200、install 200 / 404 / 400、status 200 / 422、PATCH 404、DELETE 404。
+
+> 已确认差异（Step 15 按此豁免）：
+> - `POST /install` 请求体不同——参考是 `{"url": "<BOS zip URL>"}` 并会下载解压 + chmod，
+>   sinan 是 `{"skill_key": "<本地目录名>"}`，只扫描解析不出网。原因：学习项目不接 BOS/内网平台。
+> - sinan 多一个 `GET /local`；参考无此端点（参考的包来源是远端，没有"本地未入库"这个概念）。
+> - 参考 `PATCH /{skill_key}` 对不存在的 key 会**创建**一条新记录（`create_or_update_skill` 的副作用）；
+>   sinan 先查存在性，不存在返回 404。这是有意收紧。
+> - 参考五个端点都挂 `login_required`；sinan 无认证（Step 3 已评估跳过）。
+

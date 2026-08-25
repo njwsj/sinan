@@ -139,6 +139,14 @@ def build_analyst_context(state: GenerationState) -> str:
             "\n\n当前已生成页面代码（请结合本次修改要求判断是否需要调整需求分析）:\n"
             f"```html\n{state['code']}\n```"
         )
+    # Step 12：Skill 输出与知识库资料（对齐参考 page/agents/analyst.py:183
+    # 的 state["external_knowledge"] or state["skill_result"]）
+    external = state.get("external_knowledge") or state.get("skill_result")
+    if external:
+        context += (
+            "\n\n外部资料（来自知识库与 Skill，请据此推导数据字段，不要凭空编造字段）:\n"
+            f"{external}"
+        )
     context += _build_att_context(state.get("attachments") or [])
     return context
 

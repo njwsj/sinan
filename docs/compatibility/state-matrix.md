@@ -100,8 +100,35 @@ draft → preview → published → archived
 | 门禁报告 | 6 个门（schema_validation / user_confirmation / design_completeness / syntax_integrity / quality_threshold / render_success） | 同 6 个门（Step 7） | 门名、阈值、分派表已对齐；报告额外带 `decision`/`issues`/`timestamp` 三个字段，参考只有 `gate/step/passed/score/auto_confirmed/requires_user`（`page/harness/orchestrator.py:119-126`），属 sinan 增量 |
 | 契约校验 | 5 个步骤输出契约，违规只记录不阻断 | 同 5 个（Step 7），写入 `state["contract_errors"]` | 已对齐。注意 ANALYSIS（缺 `functional_modules`）与 VALIDATION（缺 `total_rounds`）两个契约在**两边都稳定失败**，因为 analyst/verifier 实际产出结构与契约不符——参考既有行为，不要"修好" |
 | 状态机运行时校验 | 定义了 `PipelineStateMachine` 但全仓无 import | 同结构 11 态带条件转移表，同样未接入运行时 | 实施计划 7.5 的"唯一状态转移来源"参考侧也未达成，属两边共同缺口，留 Step 15 |
+| Skill 选择与执行 | 显式优先，auto 路由代码在但被硬关 | 显式优先 + 关键词路由（Step 12） | 机制对齐，路由开关状态有意不同；LLM 路由由 `skill_route_by_llm` 控制，默认关 |
+| Skill 缺链接挂起 | 是（`skill_link_required` → 会话挂起） | 是（Step 12） | 事件顺序与恢复路径已实现；sinan 多一层"已确认则不再拦"保护，待 Step 15 黑盒对照 payload |
+| Skill 状态机 | enabled / disabled | enabled / disabled / installing / failed | sinan 多两态：`failed`（本地包缺 handler.py）有写入点，`installing` 仅保留取值（本地安装是同步的，无中间态） |
 
 > 说明：Step 6 只完成模型与枚举层面的结构对齐，所有"已对齐"结论仍需在 Step 15 用黑盒测试与参考项目做同输入对照后才能确认。
+
+## Step 12 补充：Skill 挂起路径
+
+Step 12 起图有**两个**挂起出口，Session / Job 的状态流转完全相同
+（Session `paused` + `pipeline_state=user_confirm`，Job `waiting`），只有事件 payload 不同：
+
+- `skill` 节点缺链接：节点返回 `skill_link_required=True` + `status="awaiting_confirmation"`，
+  `_after_skill` 走 END；runner 发 `awaiting_confirmation{link_required: true, skill_keys: [...]}`；
+- `analyst` 低置信度（Step 7 既有行为）：发 `awaiting_confirmation{confirmation_digest, requirement_doc}`。
+
+两者都通过 `session_action_service.confirm` 恢复。缺链接场景要在请求体里带 `link` /
+`knowledge_sources`，runner `_build_state` 会合并进 state；confirm 建的是新 Job、
+`external_knowledge_loaded` 不会带过来，所以 `skill` 节点会重新执行并真正加载知识。
+
+**sinan 增量（防死循环）**：`skill` 节点在 `state["user_confirmed"]` 为 True 时**跳过链接门**。
+否则"用户点了继续但仍没给链接"会陷入「挂起 → 确认 → 再挂起」的循环。参考没有这层保护，
+因为参考的 link 判定只在首轮 runtime 预处理里跑。
+
+普通 Skill 执行失败**不挂起**（记 `skill_context.failed`，发 `skill_result{success:false}` 后继续），
+与参考 `page/api/routes/session.py:538` 的处理一致。
+
+`skill` 节点不写 `pipeline_state`：它不套 `wrap_node`，因此不触发
+`harness/orchestrator._persist()`，Session 行上看不到独立的 skill 阶段——
+参考同样没有 Skill 对应的 PipelineState 取值，属两边共同缺口。
 
 ## Step 7 补充：流水线状态由谁写
 

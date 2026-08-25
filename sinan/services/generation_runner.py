@@ -47,17 +47,41 @@ class GenerationRunner:
             "attachments": hydrated,
             "datasources": job.request_payload.get("datasources") or [],
             "template_id": job.request_payload.get("template_id"),
+            # Step 12：Skill 与知识库入参
+            "skill_keys": list(job.request_payload.get("skill_keys") or []),
+            "knowledge_sources": list(job.request_payload.get("knowledge_sources") or []),
             "fix_round": 0,
             "max_fix_rounds": settings.max_fix_rounds,
             "gate_reports": [], "contract_errors": [], "fix_history": [],
             "pipeline_state": PipelineState.INIT.value,
             "status": "routing",
         }
+        # Step 12：数据源取数（失败按 error_policy 处理，默认不阻断）
+        if state["datasources"]:
+            from sinan.services.data_service import data_service as _ds
+            try:
+                state["datasource_context"] = await _ds.resolve_datasources(state["datasources"])
+            except Exception as e:
+                logger.warning("resolve datasources failed: %s", e)
+                state["datasource_context"] = {"items": [], "ok_count": 0, "error": str(e)}
+
         if action in ("confirm", "iterate"):
             # 关键：iteration_feedback 非空 → analyzer.parse_analyst_response 不再挂起，
             #       直接 user_confirmed=True 放行到 designer（analyzer.py:160）
             state["iteration_feedback"] = body.get("feedback") or "(用户已确认，继续生成)"
             state["user_confirmed"] = True
+            # Step 12：用户在确认/迭代时补充的链接与 Skill 合并进 state，
+            # 供 skill 节点重新执行（此时 external_knowledge_loaded 未置位，会真正加载）
+            extra_links = [*(body.get("knowledge_sources") or [])]
+            if body.get("link"):
+                extra_links.append(body["link"])
+            if extra_links:
+                state["knowledge_sources"] = [
+                    *state["knowledge_sources"],
+                    *[l for l in extra_links if l not in state["knowledge_sources"]],
+                ]
+            if body.get("skill_keys"):
+                state["skill_keys"] = list(body["skill_keys"])
             # 迭代时把当前页面代码带进 state，供 analyst/designer 参考（analyzer.py:137 已支持）
             current = await page_store.get(marker)
             if current:
@@ -165,6 +189,7 @@ class GenerationRunner:
 
         step_labels = {
             "router": "正在识别需求意图...",
+            "skill": "正在准备外部资料...",  # Step 12
             "analyst": "正在分析需求...",
             "designer": "正在制定设计方案...",
             "coder": "AI 正在生成页面代码...",
@@ -218,20 +243,32 @@ class GenerationRunner:
 
             # 低置信度挂起：图在 analyst 之后就 END 了，没有 code
             if final_state.get("status") == "awaiting_confirmation":
+                link_required = bool(final_state.get("skill_link_required"))
                 await session_store.update(
                     session_id,
                     status=SessionStatus.PAUSED.value,
                     pipeline_state=PipelineState.USER_CONFIRM.value,
                     requirement_doc=final_state.get("requirement_doc") or "",
                 )
-                await event_bus.publish(
-                    session_id, events.AWAITING_CONFIRMATION,
-                    {
+                if link_required:
+                    payload = {
+                        "message": final_state.get("requirement_doc")
+                                   or "请补充知识库链接后确认继续",
+                        "link_required": True,
+                        "skill_keys": [s.get("skill_key") for s in
+                                       (final_state.get("selected_skills") or [])],
+                        "requirement_doc": "",
+                        "confirmation_digest": "",
+                    }
+                else:
+                    payload = {
                         "message": "需求信息不足，请确认后继续",
                         "confirmation_digest": (final_state.get("analysis_output") or {})
                         .get("confirmation_digest", ""),
                         "requirement_doc": final_state.get("requirement_doc") or "",
-                    },
+                    }
+                await event_bus.publish(
+                    session_id, events.AWAITING_CONFIRMATION, payload,
                     job_id=job.job_id, marker=resolved_marker,
                 )
                 await generation_job_store.mark_waiting(job.job_id, _OWNER)

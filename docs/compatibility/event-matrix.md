@@ -54,8 +54,12 @@
 | `completed` | version, preview_url, quality_score, message | 是 | 是 | 是 | → COMPLETED | `services/generation_runner.py` |
 | `error` | message, code | 是 | 是 | 是 | → FAILED | `services/generation_runner.py` |
 | `cancelled` | message | 是 | 是 | 是 | → FAILED（Step 6 换 CANCELLED） | `services/generation_runner.py` |
+| `skill_running` | skill_keys, explicit, message | 是 | 是 | 否 | 否 | `agents/skill_agent.py`（Step 12 起） |
+| `skill_result` | skill_key, name, success, output_type, content / content_preview+truncated+content_length, error | 是 | 是 | 否 | 否 | `agents/skill_agent.py`（Step 12 起） |
+| `skill_link_required` | message, skill_keys, link_required | 是 | 是 | 否 | 否（随后的 awaiting_confirmation 置 PAUSED） | `agents/skill_agent.py`（Step 12 起） |
+| `knowledge_source` | source, success, title, chars, error | 是 | 是 | 否 | 否 | `services/knowledge_context.py`（Step 12 起） |
 
-已定义常量与 data 构造器、但仍无发布点的事件：`code_snapshot`、`verify_start`（Step 15 补），`chat`（Step 8），`skill_running`、`skill_result`、`knowledge_source`（Step 12）。`gate_passed` 见下方说明。
+已定义常量与 data 构造器、但仍无发布点的事件：`code_snapshot`、`verify_start`（Step 15 补），`chat`（Step 8）。`gate_passed` 见下方说明。
 
 ## Step 7 变更
 
@@ -75,8 +79,28 @@
   同时 Session 落 `paused` + `pipeline_state=user_confirm`，Job 落 `waiting`。
 - `gate_passed` 仍无发布点：参考不发 gate 事件，门禁报告只落 `gen_session.gate_reports`（Text 列，JSON 文本）。sinan 保持一致，不擅自新增事件。
 
-## 已对齐
+## Step 12 变更
 
+- 新增 4 个事件发布点：`skill_running` / `skill_result` / `skill_link_required`
+  （均发自图的新节点 `skill`，`agents/skill_agent.py`）与 `knowledge_source`
+  （发自 `services/knowledge_context.py`，逐条知识源一条）。
+- **`step` 事件多了一个取值 `skill`**（"正在准备外部资料..."），位于 `router` 与 `analyst` 之间
+  （`generation_runner.py` 的 `step_labels`）。按 `step` 做 UI 进度条分支的地方需要同步。
+- `skill_result.content` 超过 `settings.skill_sse_preview_limit`（2000）时不发 `content`，
+  改发 `content_preview` + `truncated=true` + `content_length`，完整内容留在 state 与
+  `skill_{skill_key}` Artifact 里——对齐参考 `page/api/runtime_stream.py:375` 的截断策略。
+- `skill_link_required` **不是**终止事件（`TERMINAL_EVENTS` 未变），紧跟其后由 runner 发一条
+  `awaiting_confirmation{link_required: true, skill_keys: [...]}` 终止 SSE。参考亦为此顺序。
+- 普通 Skill 执行失败只发 `skill_result{success:false}`，不挂起、不终止，流水线继续
+  （与参考 `page/api/routes/session.py:538` 一致）。
+- 差异：参考在 runtime 层用 `step` 事件承载 skill 运行中状态
+  （`{"step": "skill_running", "agent": "skill"}`，`page/claude_code/codegen_engine.py:537`），
+  sinan 用独立事件名 `skill_running`。原因：sinan 的 `step` 语义已固定为"图节点进入"，
+  混用会污染节点进度条。Step 15 逐事件对照时按此豁免。
+- 差异：参考另有 `skill_selected` 事件（`opencode_context.py:205` 注释提及），
+  sinan 把选择结果并入 `skill_running.skill_keys`，不单独发事件。
+
+## 已对齐
 - 事件 ID 为递增整数，`Last-Event-ID` 与 `cursor` 均可续传；`replay` 按 `seq > cursor` 过滤，不丢不重
 - 事件持久化在 Redis List，服务重启后仍可回放
 - 终止事件只关闭当前 SSE 连接，key 带 TTL 存活，任务结束后再连接仍能收到 `completed`

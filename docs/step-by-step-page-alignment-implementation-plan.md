@@ -1983,6 +1983,80 @@ error policy
 - Skill 不会读取其他用户的数据；
 - 知识库上下文能传递到生成 Runtime。
 
+## 实施结论（2026-08-25，代码已落地）
+
+本 Step 有意不接参考项目的外部设施（BOS zip 包、UGate/UUAP token、PL/PALO/ku 等真实业务
+接口），全部用本地文件替代——目的是学习 agent 的 Skill 机制，而不是复刻内网集成。
+
+### 落地清单
+
+新增：
+
+```text
+sinan/services/skill_package.py       # 本地包发现与 SKILL.md 解析（替代 zip 下载解压）
+sinan/services/skill_registry.py      # skill_definition 读写门面 + 启动同步
+sinan/api/routes/admin_skills.py      # 6 个端点（参考 5 个 + GET /local）
+sinan/runtime/tool_registry.py        # 选择 / 过滤 / 路由 / 执行 / 归一化
+sinan/services/document_parser.py     # md/txt/json/html/csv/xlsx → 纯文本
+sinan/services/knowledge_context.py   # 校验→读取→解析→限长→清洗→Artifact→注入
+sinan/agents/skill_agent.py           # 图节点 skill
+sinan/skills/mock-metrics/            # 12.5 第 1 步：mock Skill
+sinan/skills/static-sales/            # 12.5 第 2 步：静态数据 Skill
+```
+
+修改：`settings.py`（Skill/知识库/数据源配置段）、`models/events.py`（4 个事件 data 构造器 +
+`SKILL_LINK_REQUIRED`）、`models/contracts.py`（`DataSourceConfig` 扩展、confirm/iterate 请求体
+加补链接字段）、`agents/state.py`（11 个 Skill/知识库/数据源键）、`agents/graph.py`
+（`router → skill → analyst` + `_after_skill`）、`agents/analyzer.py` / `agents/coder.py`
+（注入 `external_knowledge` 与 `datasource_context`）、`services/data_service.py`
+（`parse_datasource_ref` + `resolve_datasources`）、`services/generation_runner.py`
+（入参注入、数据源取数、缺链接挂起分支、`step_labels` 加 skill）、`api/app.py`
+（注册路由 + 启动同步）。
+
+### 关键设计与差异
+
+1. **包来源**：`settings.skills_dir`（默认 `./sinan/skills`）下一个目录即一个 Skill，
+   `skill_key = 目录名`，`SKILL.md` frontmatter 提供 `name/description/output_type/keywords/
+   requires_link`。相对路径按**项目根**解析（`_PROJECT_ROOT = parents[2]`），与参考
+   `page/services/skill_package.py:18` 同思路，不受启动工作目录影响。
+2. **执行协议**：子进程 `sys.executable handler.py`，stdin 收
+   `{prompt, session_id, marker, params}`，stdout 回 `{ok, content, error?}`；
+   超时 `skill_timeout_seconds`(60)，环境只透传 `PATH/LANG/LC_ALL/PYTHONPATH/HOME`，
+   不注入任何凭证（参考注入 UGATE_TOKEN / PL_API_*）。stdout 非 JSON 时整段当纯文本兜底。
+3. **选择顺序**：显式 `skill_keys` → （可选 LLM 路由，默认关）→ 关键词路由。
+   参考的 auto 路由被硬关（`codegen_engine.py:508`），sinan 打开关键词路由，
+   否则验收标准第 2 条无法验证。
+4. **缺链接挂起**：`skill_link_required` 事件 + `status=awaiting_confirmation`，
+   `_after_skill` 让图在 skill 节点后 END，runner 走既有挂起分支（Session paused / Job waiting）。
+   用户 confirm 时带 `link` / `knowledge_sources` 续跑。**sinan 增量**：`user_confirmed=True`
+   时跳过链接门，避免"确认但仍不给链接"导致无限挂起。
+5. **失败策略**：普通 Skill 失败不阻断（`skill_context.failed` + `skill_result{success:false}`），
+   与参考一致；只有缺链接才挂起。
+6. **知识库**：本地文件优先（`knowledge_dir` 前缀校验防穿越），HTTP 默认关闭
+   （`knowledge_allow_http=False`），开启后保留 SSRF 校验（拒 localhost/私网/link-local）与 1MB 上限。
+   单篇限 50000 字符、合并限 120000 字符，落 `artifact_type="knowledge"`。
+7. **数据源**：请求字段仍是 `list[str]`（对齐线上协议），由 `parse_datasource_ref` 解析成
+   `DataSourceConfig`；支持 `mock:` / `file:` / `static:` / `api:` / 裸 URL，`db:` 显式返回
+   unsupported。每条结果带 `data_schema` / `sample_data` / `timeout` / `error_policy`。
+
+### 已验证（本地自检脚本，跑完即删）
+
+- 本地包发现与解析：2 个包 `enabled`，keywords 与 handler 路径正确；
+- 子进程执行：两个 Skill 均 `ok=true`，输出为结构化 JSON；
+- 路由：`用模拟数据做个收入看板` → `mock-metrics`（命中 `模拟数据`）、
+  `做一个区域销售额看板` → `static-sales`、`做个时间页面` → 不选；
+- 显式选择：命中记 `explicit`，未安装 key 记 `explicit_missing`；
+- 缺链接：无源时挂起、有源时放行、`user_confirmed=True` 时不再拦；
+- 知识库：合法本地文件成功；越界 / 缺失 / HTTP 禁用三种失败都有明确 error 且不阻断；
+- 数据源：`mock` 成功、`db` unsupported、`file` 缺失与越界均明确报错；
+- 图编译：节点为 `router/skill/analyst/designer/coder/verifier/fixer` 共 7 个；
+- 启动同步：`sync_enabled_skills()` upsert 2 条记录；
+- 6 个 admin 端点：200 / 404 / 400 / 422 行为符合预期。
+
+**未验证**：需要真实 LLM key 的整链生成（`POST /api/page/generate` 全程 SSE 原文与最终页面
+是否真的用上了 Skill 数据），以及 Skill 输出落 `generation_artifact` 的实际行数——
+两者都要跑一次完整生成，留待手动执行。
+
 ---
 
 # Step 13：对齐 Claude Code Runtime

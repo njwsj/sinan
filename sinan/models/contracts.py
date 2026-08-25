@@ -16,12 +16,29 @@ from pydantic import AliasChoices, BaseModel, Field
 
 # ─── Step 1: Ingestion ───────────────────────────────
 class DataSourceConfig(BaseModel):
-    """数据源配置。type: api / static / database / file。"""
+    """数据源配置（Step 12 扩展）。
 
-    type: str
-    endpoint: str | None = None
+    type 取值：api / static / database / file / mock。
+    每种类型都必须能回答五个问题：怎么取（fetch）、结构是什么（data_schema）、
+    样例数据（sample_data）、多久超时（timeout）、失败怎么办（error_policy）。
+
+    与参考的差异：参考的 GenerateRequest.datasources 是 list[str]，具体语义散落在
+    opencode_context/skill_executor 里；sinan 保持请求字段为 list[str]（对齐线上协议），
+    但在 data_service.parse_datasource_ref() 里统一解析成本模型，让类型和错误策略显式化。
+    """
+
+    type: str                                   # api / static / database / file / mock
+    name: str = ""                              # 展示名，缺省用 type + 序号
+    ref: str = ""                               # 原始引用串，便于回溯
+    endpoint: str | None = None                 # api：URL
+    path: str | None = None                     # file：knowledge_dir 下的相对路径
+    query: str | None = None                    # database：SQL（当前不支持执行）
+    params: dict = Field(default_factory=dict)  # mock：{"months": 6} 等
     schema_url: str | None = None
-    sample_data: dict | None = None
+    data_schema: dict = Field(default_factory=dict)   # {字段名: 类型}
+    sample_data: dict | None = None             # {"columns": [...], "rows": [...]}
+    timeout: int = 10
+    error_policy: str = "ignore"                # ignore（失败不阻断）/ fail（抛错终止）
 
 
 class IngestionInput(BaseModel):
@@ -199,10 +216,17 @@ class GenerateRequest(BaseModel):
 
 # ─── Step 8: 会话动作请求 ───────────────────────────
 class SessionConfirmRequest(BaseModel):
-    """用户对低置信度需求的确认。confirmed=false 表示拒绝并附反馈。"""
+    """用户对低置信度需求的确认。confirmed=false 表示拒绝并附反馈。
+
+        Step 12 起额外承载「补充链接」场景：Skill 因缺少知识库链接挂起后，
+        用户在确认时通过 link / knowledge_sources 把资源补上，runner 会合并进 state。
+        """
 
     confirmed: bool = True
     feedback: str | None = None
+    link: str | None = None  # 单个补充链接的便捷写法
+    knowledge_sources: list[str] = Field(default_factory=list)
+    skill_keys: list[str] = Field(default_factory=list)
 
 
 class SessionIterateRequest(BaseModel):
@@ -211,6 +235,8 @@ class SessionIterateRequest(BaseModel):
     feedback: str = Field(..., min_length=1)
     mode: str | None = None
     attachments: list[dict] = Field(default_factory=list)
+    knowledge_sources: list[str] = Field(default_factory=list)   # Step 12
+    skill_keys: list[str] = Field(default_factory=list)          # Step 12
 
 
 class SessionAbortRequest(BaseModel):

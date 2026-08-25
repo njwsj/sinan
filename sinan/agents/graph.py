@@ -3,9 +3,9 @@
 
 对齐参考 page/agents/graph.py：
 
-    router → analyst → (条件) → designer → coder → verifier → (条件)
-                         └→ END(awaiting_confirmation)         ├→ fixer → verifier
-                                                               └→ END
+    router → skill → analyst → (条件) → designer → coder → verifier → (条件)
+               │                └→ END(awaiting_confirmation)         ├→ fixer → verifier
+               └→ END(skill_link_required)                           └→ END
 
 与 Step 6 之前的差异：删除 gate_analyze / gate_design / gate_code / gate_verify
 四个独立门禁节点。门禁不再决定路由，而是由 harness.orchestrator.wrap_node
@@ -29,6 +29,7 @@ from sinan.agents.state import GenerationState
 from sinan.agents.verifier import VerifierAgent
 from sinan.config.settings import settings
 from sinan.harness.orchestrator import wrap_node
+from sinan.agents.skill_agent import SkillAgent
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,12 @@ def _after_analyst(state: GenerationState) -> str:
     if state.get("user_confirmed") is None and state.get("status") == "awaiting_confirmation":
         return "end"
     return "designer"
+
+def _after_skill(state: GenerationState) -> str:
+    """skill 之后：缺必要链接则挂起终止，否则进入需求分析。"""
+    if state.get("skill_link_required"):
+        return "end"
+    return "analyst"
 
 
 def _should_fix(state: GenerationState) -> str:
@@ -55,6 +62,7 @@ def _should_fix(state: GenerationState) -> str:
 def build_graph(llm: LLMClient):
     """构建并编译流水线图。"""
     router = RouterAgent(llm)
+    skill = SkillAgent(llm)
     analyst = AnalyzerAgent(llm)
     designer = DesignerAgent(llm)
     coder = CoderAgent(llm)
@@ -63,6 +71,8 @@ def build_graph(llm: LLMClient):
 
     builder = StateGraph(GenerationState)
     builder.add_node("router", wrap_node(router.run, "router"))
+    # skill 不套 harness：无对应契约与门禁，与 fixer 处理方式一致
+    builder.add_node("skill", skill.run)
     builder.add_node("analyst", wrap_node(analyst.run, "analyst"))
     builder.add_node("designer", wrap_node(designer.run, "designer"))
     builder.add_node("coder", wrap_node(coder.run, "coder"))
@@ -71,7 +81,9 @@ def build_graph(llm: LLMClient):
     builder.add_node("fixer", fixer.run)
 
     builder.set_entry_point("router")
-    builder.add_edge("router", "analyst")
+    builder.add_edge("router", "skill")  # 原为 router → analyst
+    builder.add_conditional_edges("skill", _after_skill,
+                                  {"analyst": "analyst", "end": END})  # 新增
     builder.add_conditional_edges("analyst", _after_analyst,
                                   {"designer": "designer", "end": END})
     builder.add_edge("designer", "coder")

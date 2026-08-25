@@ -5,7 +5,7 @@
 | 场景 | 参考项目 | 当前 sinan | 差异/验证 |
 |---|---|---|---|
 | 新建生成 | `POST /api/page/generate`，认证，SSE 200 | `POST /api/v1/generate`，无认证，JSON `{session_id,status}` | 路径、认证、协议均不同；需 TestClient/真实 SSE 验证 |
-| 请求字段 | `prompt(min=2)`、`session_id`、`marker`、附件、模板、数据源、知识库、Skill、mode | `prompt`、`user_id`、`attachments` | 当前缺少复用和运行时选择字段 |
+| 请求字段 | `prompt(min=2)`、`session_id`、`marker`、附件、模板、数据源、知识库、Skill、mode | 同字段集（Step 1 已对齐；`skill_keys`/`knowledge_sources`/`datasources` 自 Step 12 起真正生效） | 字段集已齐；`mode` 仍未使用（Step 13/14） |
 | 空 prompt | Pydantic 422（空值/长度不满足） | 目前可进入创建流程 | 需锁定 HTTP 码和错误 JSON |
 | 过长 prompt | 需以参考配置/模型实际限制验证 | 未声明上限 | 记录实际边界，不凭注释猜测 |
 | 生成失败 | SSE 已建立后发送 `error` 事件，通常 HTTP 仍为 200 | SSE 中发送 `error`，Session 置 `failed` | 事件 payload、终止事件和重连行为不同 |
@@ -45,3 +45,18 @@
 | 跨用户读/改 Session、Page | 无隔离 | 暂不实现（已评估跳过） | 单用户使用，暂无隔离需求 |
 | UGate Token | 未实现 | 暂不实现（已评估跳过） | 无接外部平台需求；后台 Job 需 token 时再补 |
 | 认证失败格式 | 未实现 | 暂不实现（已评估跳过） | 全局 `SinanError` 处理器仍可返回 401/403，但无接入点 |
+
+## Step 12 差异状态
+
+`GenerateRequest` 字段集在 Step 1 就已对齐，本 Step 只是让三个字段真正生效——生成入口未改动，
+`generate.py` 的 `req.model_dump(mode="json")` 整体入 `payload`，新字段自然流到 `_build_state`。
+
+| 差异项 | Step 0 状态 | 当前状态 | 待验证 |
+|---|---|---|---|
+| `skill_keys` | 接收但不使用 | 生效：显式强制选择并绕过路由（`runtime/tool_registry.resolve_explicit`） | 同 prompt + 同 skill_keys 下对照两边 `skill_result` payload |
+| `knowledge_sources` | 接收但不使用 | 生效：本地文件解析后注入 `external_knowledge` | HTTP 源在 sinan 默认被拒（`success=false` + 明确 error），参考会真抓 |
+| `datasources` | 接收但不使用 | 生效：解析成 `DataSourceConfig` 取数，结果经 `datasource_context` 注入 coder | `db:` 前缀返回 unsupported；`api:` 走 httpx 无凭证 |
+| Skill 安装请求体 | 无该接口 | `{"skill_key": "<本地目录名>"}` | 与参考 `{"url": "<zip>"}` 不兼容，已在 api-matrix 登记豁免 |
+| `SessionConfirmRequest` | `{confirmed, feedback}` | 增加 `link` / `knowledge_sources` / `skill_keys` | 参考 `/confirm` 是无模型自由 dict，本就按 Step 8 说明豁免 |
+| `SessionIterateRequest` | `{feedback, mode, attachments}` | 增加 `knowledge_sources` / `skill_keys` | 同上 |
+| `DataSourceConfig` | `type/endpoint/schema_url/sample_data` | 扩展为 11 字段（含 `data_schema`/`timeout`/`error_policy`/`params`/`path`/`query`/`ref`/`name`） | 参考无对应模型，属 sinan 显式化增量，不参与逐字段对照 |

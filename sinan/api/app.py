@@ -7,7 +7,7 @@ import time
 import logging
 from pathlib import Path
 from sinan.core.exceptions import SinanError
-
+from sinan.api.routes.admin_skills import router as admin_skills_router
 from sinan.config.settings import settings
 from sinan.core.logging import setup_logging
 from sinan.models.database import init_db
@@ -41,6 +41,15 @@ async def lifespan(app: FastAPI):
     from sinan.services.redis import create_redis
     create_redis()
     from sinan.services.generation_supervisor import start_supervisor, stop_supervisor
+    # Step 12：把本地 skills 目录同步进 skill_definition 表。
+    # 必须在 start_supervisor 之前——supervisor 一起来就可能恢复上次遗留的 Job 并进入
+    # skill 节点，此时 Skill 表若还没同步完，会误判为"没有可用 Skill"。
+    # 对齐参考 skill_package.sync_enabled_skills 的时机；失败只告警，不影响服务启动。
+    from sinan.services.skill_registry import skill_registry
+    try:
+        await skill_registry.sync_enabled_skills()
+    except Exception:
+        logging.getLogger(__name__).exception("skill sync on startup failed")
     await start_supervisor()
     yield
     # 服务器关闭时：在此处添加清理逻辑
@@ -96,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(prompt_template_router)  # Step 11：Prompt 模板管理
     app.include_router(hosting_router)  # Step 10：托管 + 发布/取消/回滚
     app.include_router(storage_router)  # Step 10：服务 LocalStorage 文件
+    app.include_router(admin_skills_router)  # Step 12：Skill 管理
     # 旧接口，过渡期保留
     app.include_router(legacy_health_router)
     app.include_router(legacy_generate_router)

@@ -78,6 +78,17 @@ class CoderAgent:
         att_context = _build_att_context(state.get("attachments") or [])
         if att_context:
             user_content += att_context
+        # Step 12：Skill / 知识库 / 数据源上下文
+        external = state.get("external_knowledge") or state.get("skill_result")
+        if external:
+            user_content += (
+                "\n\n外部资料（知识库 + Skill 输出）。若其中含表格或 rows 数据，"
+                "必须直接用于图表 series data，字段名保持一致，禁止编造数值：\n"
+                f"{external}"
+            )
+        ds_context = _build_datasource_context(state.get("datasource_context"))
+        if ds_context:
+            user_content += ds_context
 
         # 模板代码注入（对齐参考 coder.py:596-613）
         template_code = state.get("template_code")
@@ -168,3 +179,23 @@ def _doc_text(value: object) -> str:
     if isinstance(value, list):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+def _build_datasource_context(datasource_context: dict | None) -> str:
+    """把 data_service.resolve_datasources() 的结果渲染成 coder 可读的上下文。"""
+    if not datasource_context:
+        return ""
+    items = datasource_context.get("items") or []
+    parts = []
+    for item in items:
+        if not item.get("ok"):
+            parts.append(f"【数据源：{item.get('name')}（{item.get('type')}）不可用："
+                         f"{item.get('error')}，请在页面上给出空态提示，不要编造数据】")
+            continue
+        sample = item.get("sample_data") or {}
+        parts.append(
+            f"【数据源：{item.get('name')}（{item.get('type')}）】\n"
+            f"字段：{', '.join(str(c) for c in (sample.get('columns') or []))}\n"
+            f"共 {sample.get('row_count', 0)} 行，数据：\n"
+            f"{json.dumps(sample.get('rows') or [], ensure_ascii=False)}"
+        )
+    return "\n\n" + "\n\n".join(parts) if parts else ""
