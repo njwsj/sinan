@@ -466,6 +466,7 @@ class GenerationRunner:
         （_heartbeat_loop 每 20s 调一次 heartbeat，把 lease_until 续到 now+90s）。
         """
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(job_id))
+        _lf_trace = None  # 保存 trace 对象，供失败时更新
         try:
             action = (job.request_payload or {}).get("action", "generate")
             with trace(
@@ -481,7 +482,7 @@ class GenerationRunner:
                     "marker": job.marker,
                     "owner": _OWNER,
                 },
-            ):
+            ) as _lf_trace:
                 if action == "confirm":
                     await self._run_confirm(job)
                 elif action == "iterate":
@@ -492,10 +493,25 @@ class GenerationRunner:
                 if latest and latest.status == CANCELLED:
                     return                                            # 被取消：不置 completed
                 await generation_job_store.mark_completed(job_id, _OWNER)
+                # 成功：更新 trace output 并打 success 标签
+                if _lf_trace:
+                    _lf_trace.update(output={"status": "completed"}, tags=["success"])
         except asyncio.CancelledError:
             raise                                                 # 关机取消：交给下次恢复，不置 failed
         except Exception as e:
             logger.exception("generation job failed: job_id=%s", job_id)
+            # 失败：更新 trace，打 error 标签，方便在 Langfuse 里直接过滤
+            if _lf_trace:
+                _lf_trace.update(
+                    output={"status": "failed", "error": str(e)[:500]},
+                    tags=["error"],
+                    metadata={
+                        "job_id": job.job_id,
+                        "marker": job.marker,
+                        "owner": _OWNER,
+                        "error_type": type(e).__name__,
+                    },
+                )
             # 失败：置 failed，supervisor_loop 主要是针对进程崩溃这种情况，干净异常失败（LLM 报错、验证抛异常）因为这类失败重跑大概率还是同样结果，自动重试没意义，交给用户重新发起。
             await generation_job_store.mark_failed(job_id, _OWNER, str(e) or type(e).__name__)
             await session_store.update(
