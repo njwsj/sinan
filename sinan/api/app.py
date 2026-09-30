@@ -61,6 +61,9 @@ async def lifespan(app: FastAPI):
     await stop_supervisor()
     from sinan.services.redis import close_redis
     await close_redis()
+    # Langfuse 兜底：把最后一批 trace 刷上去
+    from sinan.observability.langfuse import flush
+    flush()
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)

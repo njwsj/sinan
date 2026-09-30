@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     datasource_timeout_seconds: int = 10          # api 类数据源单次请求超时
     datasource_error_policy: str = "ignore"       # ignore / fail：默认失败不阻断流水线
 
+    # --- Langfuse（可观测性）---
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://us.cloud.langfuse.com"
+
     @property
     def database_url(self) -> str:
         return (

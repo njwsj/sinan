@@ -20,6 +20,7 @@ from sinan.services.generation_job_store import generation_job_store, CANCELLED
 from sinan.services import cancel_registry
 from sinan.models import events
 from sinan.models.enums import PipelineState
+from sinan.observability.langfuse import trace
 
 _OWNER = f"{socket.gethostname()}:{uuid.uuid4().hex[:12]}"
 _LEASE_SECONDS = 90
@@ -467,16 +468,30 @@ class GenerationRunner:
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(job_id))
         try:
             action = (job.request_payload or {}).get("action", "generate")
-            if action == "confirm":
-                await self._run_confirm(job)
-            elif action == "iterate":
-                await self._run_iterate(job)
-            else:
-                await self._execute_generation_pipeline(job)
-            latest = await generation_job_store.get_job(job_id)   # finalize 前复查
-            if latest and latest.status == CANCELLED:
-                return                                            # 被取消：不置 completed
-            await generation_job_store.mark_completed(job_id, _OWNER)
+            with trace(
+                name=f"generation.{action}",
+                session_id=job.session_id,
+                user_id=(job.request_payload or {}).get("user_id"),
+                input={
+                    "action": action,
+                    "prompt": (job.request_payload or {}).get("prompt"),
+                },
+                metadata={
+                    "job_id": job.job_id,
+                    "marker": job.marker,
+                    "owner": _OWNER,
+                },
+            ):
+                if action == "confirm":
+                    await self._run_confirm(job)
+                elif action == "iterate":
+                    await self._run_iterate(job)
+                else:
+                    await self._execute_generation_pipeline(job)
+                latest = await generation_job_store.get_job(job_id)   # finalize 前复查
+                if latest and latest.status == CANCELLED:
+                    return                                            # 被取消：不置 completed
+                await generation_job_store.mark_completed(job_id, _OWNER)
         except asyncio.CancelledError:
             raise                                                 # 关机取消：交给下次恢复，不置 failed
         except Exception as e:

@@ -6,6 +6,9 @@ import logging
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
+from sinan.observability.langfuse import generation as lf_generation
+from sinan.observability.langfuse import usage_from_openai
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,23 +47,49 @@ class LLMClient:
         :raises httpx.HTTPStatusError: HTTP 429 时触发 tenacity 重试（指数退避）
         :raises httpx.ReadTimeout: 响应超时，直接失败不重试
         """
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                },
-            )
-            if not resp.is_success:
-                logger.error("LLM error: status=%d body=%s", resp.status_code, resp.text)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+        gen = lf_generation(
+            name="llm.chat",
+            model=self.model,
+            input=messages,
+            model_parameters={"temperature": temperature},
+        )
+        output = None
+        usage = None
+        level = None
+        status_message = None
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": temperature,
+                    },
+                )
+                if not resp.is_success:
+                    logger.error("LLM error: status=%d body=%s", resp.status_code, resp.text)
+                resp.raise_for_status()
+                data = resp.json()
+                output = data["choices"][0]["message"]["content"]
+                usage = usage_from_openai(data.get("usage"))
+                return output
+        except Exception as e:
+            level = "ERROR"
+            status_message = str(e) or type(e).__name__
+            raise
+        finally:
+            if gen:
+                gen.end(
+                    output=output,
+                    usage=usage,
+                    level=level,
+                    status_message=status_message,
+                )
 
     async def astream(self, messages: list[dict], temperature: float = 0.7):
         """
@@ -68,56 +97,78 @@ class LLMClient:
         用于 coder/analyzer/designer 节点实时推送生成进度。
         429 限流时等待后重试（最多 5 次，指数退避 5s→10s→20s→40s→60s）。
         """
-        for attempt in range(5):
-            try:
-                async with httpx.AsyncClient(timeout=300) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "temperature": temperature,
-                            "stream": True,
-                        },
-                    ) as resp:
-                        if resp.status_code == 429:
-                            wait = min(5 * (2 ** attempt), 60)
-                            logger.warning("LLM stream 429, retry %d/%d after %ds", attempt + 1, 5, wait)
-                            await asyncio.sleep(wait)
-                            continue
-                        if not resp.is_success:
-                            body = await resp.aread()
-                            logger.error("LLM stream error: status=%d body=%s", resp.status_code, body)
-                            resp.raise_for_status()
-                        buffer = ""
-                        async for chunk_text in resp.aiter_text():
-                            buffer += chunk_text
-                            while "\n" in buffer:
-                                line, buffer = buffer.split("\n", 1)
-                                line = line.rstrip("\r")
-                                if not line or not line.startswith("data: "):
-                                    continue
-                                data = line[6:]
-                                if data.strip() == "[DONE]":
-                                    return
-                                try:
-                                    chunk = json.loads(data)
-                                    delta = chunk["choices"][0]["delta"].get("content", "")
-                                    if delta:
-                                        yield delta
-                                except (json.JSONDecodeError, KeyError, IndexError):
-                                    continue
-                        return  # 正常完成
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429 and attempt < 4:
-                    wait = min(5 * (2 ** attempt), 60)
-                    logger.warning("LLM stream 429 (exc), retry %d/%d after %ds", attempt + 1, 5, wait)
-                    await asyncio.sleep(wait)
-                    continue
-                raise
-        raise RuntimeError("LLM stream 429 限流，已重试 5 次仍失败")
+        gen = lf_generation(
+            name="llm.astream",
+            model=self.model,
+            input=messages,
+            model_parameters={"temperature": temperature},
+        )
+        chunks: list[str] = []
+        level = None
+        status_message = None
+        try:
+            for attempt in range(5):
+                try:
+                    async with httpx.AsyncClient(timeout=300) as client:
+                        async with client.stream(
+                            "POST",
+                            f"{self.base_url}/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "model": self.model,
+                                "messages": messages,
+                                "temperature": temperature,
+                                "stream": True,
+                            },
+                        ) as resp:
+                            if resp.status_code == 429:
+                                wait = min(5 * (2 ** attempt), 60)
+                                logger.warning("LLM stream 429, retry %d/%d after %ds", attempt + 1, 5, wait)
+                                await asyncio.sleep(wait)
+                                continue
+                            if not resp.is_success:
+                                body = await resp.aread()
+                                logger.error("LLM stream error: status=%d body=%s", resp.status_code, body)
+                                resp.raise_for_status()
+                            buffer = ""
+                            async for chunk_text in resp.aiter_text():
+                                buffer += chunk_text
+                                while "\n" in buffer:
+                                    line, buffer = buffer.split("\n", 1)
+                                    line = line.rstrip("\r")
+                                    if not line or not line.startswith("data: "):
+                                        continue
+                                    data = line[6:]
+                                    if data.strip() == "[DONE]":
+                                        return
+                                    try:
+                                        chunk = json.loads(data)
+                                        delta = chunk["choices"][0]["delta"].get("content", "")
+                                        if delta:
+                                            chunks.append(delta)
+                                            yield delta
+                                    except (json.JSONDecodeError, KeyError, IndexError):
+                                        continue
+                            return  # 正常完成
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429 and attempt < 4:
+                        wait = min(5 * (2 ** attempt), 60)
+                        logger.warning("LLM stream 429 (exc), retry %d/%d after %ds", attempt + 1, 5, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    raise
+            raise RuntimeError("LLM stream 429 限流，已重试 5 次仍失败")
+        except Exception as e:
+            level = "ERROR"
+            status_message = str(e) or type(e).__name__
+            raise
+        finally:
+            if gen:
+                gen.end(
+                    output="".join(chunks),
+                    level=level,
+                    status_message=status_message,
+                )

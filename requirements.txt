@@ -26,4 +26,5 @@ pytest
 pytest-asyncio
 mock
 beautifulsoup4>=4.12.0
+langfuse>=2.60,<3
 -e .
